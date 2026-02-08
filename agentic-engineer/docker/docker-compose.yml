@@ -1,0 +1,14 @@
+version: "3.9"
+services:
+  agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./target_project:/workspace
+      - ./agent_data:/agent_data
+    environment:
+      - WORKSPACE_ROOT=/workspace
+      - AGENT_DATA_DIR=/agent_data
