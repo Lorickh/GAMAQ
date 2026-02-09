@@ -139,6 +139,10 @@ pytest -q
 - `WORKSPACE_ROOT`：默认 `/workspace`
 - `AGENT_DATA_DIR`：默认 `/agent_data`
 - `LLM_API_KEY` / `LLM_MODEL`：LLM 网关配置（MVP 可为空）
+- `LLM_BASE_URL`：LLM 网关基础地址（默认 `http://127.0.0.1:8000`）
+- `LLM_ENDPOINT`：LLM 网关路径（默认 `/v1/chat/completions`）
+- `LLM_TIMEOUT_SEC`：LLM 请求超时时间（秒，默认 `30`）
+- `LLM_SYSTEM_PROMPT`：系统提示语（默认要求输出 JSON 计划）
 
 ## License
 
