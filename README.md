@@ -143,6 +143,17 @@ pytest -q
 - `LLM_ENDPOINT`：LLM 网关路径（默认 `/v1/chat/completions`）
 - `LLM_TIMEOUT_SEC`：LLM 请求超时时间（秒，默认 `30`）
 - `LLM_SYSTEM_PROMPT`：系统提示语（默认要求输出 JSON 计划）
+- `LLM_EXTRA_HEADERS`：JSON 字符串，附加请求头（例如自定义鉴权）
+- `LLM_DEBUG_LOG`：启用 LLM 请求/响应日志（写入 `${AGENT_DATA_DIR}/events.log`）
+- `LLM_LOG_MAX_CHARS`：LLM 日志单条最大长度（默认 `2000`）
+
+## LLM 网关日志查看
+
+开启 `LLM_DEBUG_LOG=1` 后，LLM 请求与响应会写入 `${AGENT_DATA_DIR}/events.log`，可用以下方式查看：
+
+```bash
+tail -f /agent_data/events.log
+```
 
 ## License
 
