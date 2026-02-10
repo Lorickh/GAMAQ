@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from typing import Any, Dict, Optional
 
 import requests
@@ -94,8 +95,23 @@ def make_plan(context: Dict[str, Any], evidence: str) -> LLMPlan:
 
 
 def parse_plan(payload: str) -> LLMPlan:
-    data = json.loads(payload)
+    data = _parse_json_payload(payload)
     return LLMPlan(**data)
+
+
+def _parse_json_payload(payload: str) -> Dict[str, Any]:
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        pass
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", payload, re.DOTALL)
+    if fenced:
+        return json.loads(fenced.group(1))
+    first_brace = payload.find("{")
+    last_brace = payload.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        return json.loads(payload[first_brace:last_brace + 1])
+    raise ValueError("Unable to parse JSON payload from LLM response")
 
 
 def _log_llm_event(event_type: str, payload: Dict[str, Any]) -> None:
