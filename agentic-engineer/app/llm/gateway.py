@@ -96,7 +96,74 @@ def make_plan(context: Dict[str, Any], evidence: str) -> LLMPlan:
 
 def parse_plan(payload: str) -> LLMPlan:
     data = _parse_json_payload(payload)
+    data = _normalize_plan_payload(data)
     return LLMPlan(**data)
+
+
+def _normalize_plan_payload(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize legacy planner schemas to current ``LLMPlan`` shape."""
+    if _is_current_plan_schema(data):
+        return data
+
+    legacy_steps = data.get("plan")
+    if not isinstance(legacy_steps, list):
+        return data
+
+    steps = []
+    for raw_step in legacy_steps:
+        if not isinstance(raw_step, dict):
+            continue
+        if {"tool", "args", "why"}.issubset(raw_step.keys()):
+            steps.append(raw_step)
+            continue
+        steps.append(_legacy_step_to_tool_step(raw_step))
+
+    plan_summary = str(data.get("plan_summary") or data.get("summary") or "Generated execution plan")
+    risk_notes = data.get("risk_notes")
+    if not isinstance(risk_notes, list):
+        risk_notes = ["Legacy plan format received from LLM"]
+
+    done_when = str(data.get("done_when") or "All planned steps are completed")
+    intent = str(data.get("intent") or "fix_code")
+
+    return {
+        "intent": intent,
+        "plan_summary": plan_summary,
+        "steps": steps,
+        "risk_notes": risk_notes,
+        "done_when": done_when,
+    }
+
+
+def _is_current_plan_schema(data: Dict[str, Any]) -> bool:
+    required_keys = {"plan_summary", "steps", "risk_notes", "done_when"}
+    return required_keys.issubset(data.keys())
+
+
+def _legacy_step_to_tool_step(raw_step: Dict[str, Any]) -> Dict[str, Any]:
+    cmd = raw_step.get("cmd") or raw_step.get("command")
+    step_why = raw_step.get("why") or raw_step.get("description") or raw_step.get("action") or "legacy step"
+
+    if cmd:
+        return {
+            "tool": "run_cmd",
+            "args": {
+                "cmd": str(cmd),
+                "cwd": str(raw_step.get("cwd") or "/workspace"),
+                "timeout_sec": int(raw_step.get("timeout_sec") or 120),
+            },
+            "why": str(step_why),
+        }
+
+    return {
+        "tool": "run_cmd",
+        "args": {
+            "cmd": "echo legacy step",
+            "cwd": str(raw_step.get("cwd") or "/workspace"),
+            "timeout_sec": int(raw_step.get("timeout_sec") or 30),
+        },
+        "why": str(step_why),
+    }
 
 
 def _parse_json_payload(payload: str) -> Dict[str, Any]:
