@@ -94,9 +94,13 @@ NPU server 的首包和控制命令：
 - 每个线程只保持 1 个 outstanding WR，完成轮询不 sleep。因此结果代表
   CPU post + doorbell + completion 的同步性能。
 - 预热不计时；所有线程经 gate 同时开始；吞吐按最慢线程的 wall time 计算。
-- 尽量为线程分配互不重叠的 HBM offset。若 NPU 仍只分配原来的 8 KiB，则回退到
-  offset 0；做 4/8 线程测试时建议把 NPU `MEM_SIZE` 至少改为
-  `max_threads * 4096`，最好使用 64 MiB 以上并按 cache/page 做间隔。
+- 为每个线程分配严格不重叠的 HBM 范围。在创建 URMA 资源及发送 WR 前，先对
+  整个参数矩阵的最大 footprint 做预检：`max(threads) * max(sizes)` 必须同时
+  不超过 `hbm_len` 和 `remote_seg.len`，目标最后一字节的 UBVA 不得溢出。
+  容量不足直接报错退出（状态码 2），不再回退 offset 0，也不运行部分测试矩阵。
+  例如 8 KiB 只允许 2 线程×4 KiB；8 线程×4 KiB 至少需要 32 KiB，
+  32 线程×4 KiB 至少需要 128 KiB，且 NPU 端分配和注册的长度都必须满足要求。
+  各 case 顺序复用同一范围；范围之间暂不增加页间隔。
 - CSV 中 `avg_thread_latency_us` 是所有线程执行时间之和除以完成操作总数；它不是
   p50/p99。若需要分位数，应抽样记录单次延迟，避免每次记录本身扰动热路径。
 
@@ -167,3 +171,37 @@ CANN/URMA 版本、EID、MTU 和 CPU governor。
 未核实字段写成稳定 ABI。落地时应优先对照目标机器 SDK 自带的 `urma_api.h`、
 `network/hccp*.h`、样例和对应版本《API Reference》，尤其检查线程安全、token、
 CQ depth、Jetty mode 和销毁 API。
+
+
+## 7. 无 URMA SDK 的边界验证
+
+`examples/transfer_layout.h` 是无设备依赖的布局检查，不是传输后端。
+其数值契约为：每个线程拥有连续的 `size` 字节范围，所有线程的总 footprint
+同时受 HBM 与注册 segment 的长度约束。V1 协议仍要求 HBM 起始字节对应
+`remote_seg.ubva.va`；`hbm_ptr` 不作为 CPU 可解引用地址，也不能仅靠数值检查
+证明两个地址空间的映射或对端元数据真实性。预检失败时 Host 关闭控制连接；
+原 NPU server 应处理 EOF 并释放资源，不会收到 WRITE_DONE/DONE。
+
+```bash
+cmake -S examples -B /tmp/gamaq-cpu-tests -DBUILD_URMA_BENCH=OFF
+cmake --build /tmp/gamaq-cpu-tests -j
+ctest --test-dir /tmp/gamaq-cpu-tests --output-on-failure
+```
+
+无 CMake 时：
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/transfer_layout_test.cpp -o /tmp/transfer_layout_test
+/tmp/transfer_layout_test
+```
+
+这些测试验证数值边界和布局隔离，不验证 SDK ABI、设备传输、HBM 数据一致性或性能。
+正常 benchmark 构建仍默认开启；CSV 列和有效配置下的地址计算保持不变。
+默认线程/大小矩阵对 8 KiB NPU 分配现在会明确拒绝，需要扩充并重新注册 HBM，
+或显式使用 `--threads 1,2`。
+
+本轮新增使用的 `urma_seg_t::len` 已核对
+[openEuler 24.03 LTS SP4 URMA API Guide §2.3.2.1.4](https://docs.openeuler.org/zh/docs/24.03_LTS_SP4/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)，
+查阅日期 2026-10-01；该核对不能替代目标机器匹配驱动的 SDK 编译。
+后续迭代记录见 [middleware_evolution.md](middleware_evolution.md)。

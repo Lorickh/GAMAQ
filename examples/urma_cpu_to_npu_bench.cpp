@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "urma_api.h"
+#include "transfer_layout.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -268,14 +269,14 @@ int create_context(urma_device_t *device, uint32_t eid_index, uint32_t max_size,
     return c->remote_jetty ? 0 : -1;
 }
 
-int post_write(ThreadContext *c, const NpuHbmExport &remote, uint64_t remote_offset,
+int post_write(ThreadContext *c, uint64_t remote_address,
                uint32_t size) {
     urma_sge_t local {};
     local.addr = reinterpret_cast<uint64_t>(c->buffer);
     local.len = size;
     local.tseg = c->local_seg;
     urma_sge_t target {};
-    target.addr = remote.remote_seg.ubva.va + remote_offset;
+    target.addr = remote_address;
     target.len = size;
     target.tseg = c->remote_seg;
     urma_sg_t src {};
@@ -307,9 +308,22 @@ int post_write(ThreadContext *c, const NpuHbmExport &remote, uint64_t remote_off
 
 struct Result { uint64_t operations = 0, nanoseconds = 0; int status = 0; };
 
+bool check_layout(const NpuHbmExport &remote, uint32_t threads, uint32_t size) {
+    const auto error = gamaq::validate_write_layout(remote.remote_seg.ubva.va,
+        remote.hbm_len, remote.remote_seg.len, threads, size);
+    if (error == gamaq::LayoutError::none) return true;
+    std::fprintf(stderr, "invalid WRITE layout: %s (threads=%u, payload=%u, "
+        "required_bytes=%llu, hbm_bytes=%llu, segment_bytes=%llu)\n",
+        gamaq::layout_error_message(error), threads, size,
+        static_cast<unsigned long long>(uint64_t{threads} * size),
+        static_cast<unsigned long long>(remote.hbm_len),
+        static_cast<unsigned long long>(remote.remote_seg.len));
+    return false;
+}
+
 int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remote,
              uint32_t thread_count, uint32_t size, uint64_t warmup, uint64_t iterations) {
-    if (remote.hbm_len < size) return -1;
+    if (!check_layout(remote, thread_count, size)) return -1;
     std::vector<ThreadContext> contexts(thread_count);
     for (auto &context : contexts) {
         if (create_context(device, eid_index, size, remote, &context)) {
@@ -322,18 +336,23 @@ int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remo
     std::vector<std::thread> workers;
     for (uint32_t id = 0; id < thread_count; ++id) {
         workers.emplace_back([&, id] {
-            // Prefer disjoint HBM ranges. Fall back to shared offset zero when
-            // the original sample's small 8 KiB allocation is used.
-            uint64_t offset = uint64_t{id} * size;
-            if (offset + size > remote.hbm_len) offset = 0;
+            // Validated before resource creation; never fall back to a shared
+            // destination. Planning stays outside the timed path.
+            const auto region = gamaq::plan_write_region(remote.remote_seg.ubva.va,
+                remote.hbm_len, remote.remote_seg.len, thread_count, size, id);
+            if (!region) {
+                results[id].status = -1;
+                gate.arrive_and_wait();
+                return;
+            }
             for (uint64_t n = 0; n < warmup; ++n) {
-                if ((results[id].status = post_write(&contexts[id], remote, offset, size))) break;
+                if ((results[id].status = post_write(&contexts[id], region->address, size))) break;
             }
             gate.arrive_and_wait();
             if (results[id].status) return;
             auto begin = Clock::now();
             for (uint64_t n = 0; n < iterations; ++n) {
-                if ((results[id].status = post_write(&contexts[id], remote, offset, size))) break;
+                if ((results[id].status = post_write(&contexts[id], region->address, size))) break;
                 ++results[id].operations;
             }
             results[id].nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
@@ -382,6 +401,13 @@ int main(int argc, char **argv) {
     if (transfer_all(fd, &remote, sizeof(remote), false) || remote.magic != kMagic ||
         remote.version != kVersion) {
         std::fprintf(stderr, "invalid NPU export\n"); close(fd); return 1;
+    }
+    // Validate the largest footprint in the entire matrix before any URMA
+    // resources or WRs, so an invalid later case cannot leave partial results.
+    if (!check_layout(remote, *std::max_element(options.threads.begin(), options.threads.end()),
+                      *std::max_element(options.sizes.begin(), options.sizes.end()))) {
+        close(fd);
+        return 2;
     }
     urma_eid_t eid {};
     if (!parse_eid(options.host_eid, &eid)) { std::fprintf(stderr, "invalid host EID\n"); return 2; }
