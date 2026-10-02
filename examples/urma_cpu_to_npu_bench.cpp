@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "urma_api.h"
+#include "completion_tracker.h"
 #include "transfer_layout.h"
 
 namespace {
@@ -32,7 +33,6 @@ constexpr uint32_t kMagic = 0x48424D55;
 constexpr uint32_t kVersion = 1;
 constexpr uint64_t kPageSize = 4096;
 constexpr uint32_t kJettyDepth = 256;
-constexpr int kMaxPolls = 1000000;
 
 enum class ControlCommand : uint32_t { kHostWriteDone = 1, kFillHbm = 2, kDone = 3 };
 
@@ -62,6 +62,7 @@ struct Options {
     std::vector<uint32_t> sizes {512, 1024, 2048, 4096};
     uint64_t iterations = 10000;
     uint64_t warmup = 100;
+    uint64_t completion_timeout_ms = 5000;
 };
 
 struct StartGate {
@@ -87,6 +88,8 @@ struct ThreadContext {
     urma_target_jetty_t *remote_jetty = nullptr;
     void *buffer = nullptr;
     uint64_t request_id = 0;
+    gamaq::CompletionTracker completions;
+    bool safe_to_destroy = true;
 };
 
 bool parse_u64(const char *s, uint64_t *out) {
@@ -127,6 +130,7 @@ bool parse_options(int argc, char **argv, Options *o) {
         else if (arg == "--sizes") { const char *v = value("--sizes"); if (!v || !parse_list(v, &o->sizes)) return false; }
         else if (arg == "--iterations") { const char *v = value("--iterations"); if (!v || !parse_u64(v, &o->iterations) || !o->iterations) return false; }
         else if (arg == "--warmup") { const char *v = value("--warmup"); if (!v || !parse_u64(v, &o->warmup)) return false; }
+        else if (arg == "--completion-timeout-ms") { const char *v = value("--completion-timeout-ms"); if (!v || !parse_u64(v, &o->completion_timeout_ms) || !o->completion_timeout_ms || o->completion_timeout_ms > 3600000) return false; }
         else return false;
     }
     return std::all_of(o->sizes.begin(), o->sizes.end(), [](uint32_t n) { return n >= 512 && n <= 4096; });
@@ -189,6 +193,12 @@ int find_eid_index(urma_device_t *device) {
 }
 
 void destroy_context(ThreadContext *c) {
+    if (!c->safe_to_destroy || !c->completions.empty()) {
+        std::fprintf(stderr, "quarantining URMA context with %zu possibly in-flight WR(s); "
+                             "process exit owns final provider cleanup\n",
+                     c->completions.in_flight());
+        return;
+    }
     // Dependents are destroyed before their owners.  Do not share these
     // objects between worker threads: vendor thread-safety is not assumed.
     if (c->remote_jetty) urma_unimport_jetty(c->remote_jetty);
@@ -258,7 +268,10 @@ int create_context(urma_device_t *device, uint32_t eid_index, uint32_t max_size,
     import_flag.bs.cacheable = URMA_NON_CACHEABLE;
     import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
     import_flag.bs.mapping = URMA_SEG_NOMAP;
-    c->remote_seg = urma_import_seg(c->context, &remote.remote_seg, &token, 0, import_flag);
+    // The public API accepts a mutable segment descriptor. Import a copy so
+    // the provider cannot mutate the control-plane export retained by callers.
+    urma_seg_t remote_seg = remote.remote_seg;
+    c->remote_seg = urma_import_seg(c->context, &remote_seg, &token, 0, import_flag);
     if (!c->remote_seg) return -1;
     urma_rjetty_t rjetty {};
     rjetty.jetty_id = remote.remote_jetty_id;
@@ -269,8 +282,8 @@ int create_context(urma_device_t *device, uint32_t eid_index, uint32_t max_size,
     return c->remote_jetty ? 0 : -1;
 }
 
-int post_write(ThreadContext *c, uint64_t remote_address,
-               uint32_t size) {
+int post_write(ThreadContext *c, uint64_t remote_address, uint32_t size,
+               uint64_t timeout_ms) {
     urma_sge_t local {};
     local.addr = reinterpret_cast<uint64_t>(c->buffer);
     local.len = size;
@@ -293,17 +306,56 @@ int post_write(ThreadContext *c, uint64_t remote_address,
     wr.tjetty = c->remote_jetty;
     wr.user_ctx = ++c->request_id;
     wr.rw = rw;
+    auto tracking = c->completions.submit(wr.user_ctx, size);
+    if (tracking != gamaq::CompletionError::none) {
+        std::fprintf(stderr, "cannot track WR %llu: %s\n",
+            static_cast<unsigned long long>(wr.user_ctx),
+            gamaq::completion_error_message(tracking));
+        return -1;
+    }
     urma_jfs_wr_t *bad = nullptr;
     int rc = urma_post_jetty_send_wr(c->jetty, &wr, &bad);
-    if (rc) return rc;
-    for (int poll = 0; poll < kMaxPolls; ++poll) {
+    if (rc) {
+        c->completions.cancel_unposted(wr.user_ctx);
+        return rc;
+    }
+    const auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
+    uint64_t polls = 0;
+    for (;;) {
         urma_cr_t completion {};
         int count = urma_poll_jfc(c->jfc, 1, &completion);
-        if (count < 0) return count;
-        if (count > 0) return completion.status == URMA_CR_SUCCESS ? 0 : -1;
-        // Deliberately no usleep(): this measures CPU polling/doorbell latency.
+        if (count < 0) {
+            c->safe_to_destroy = false;
+            std::fprintf(stderr, "urma_poll_jfc failed for WR %llu: %d\n",
+                static_cast<unsigned long long>(wr.user_ctx), count);
+            return count;
+        }
+        if (count > 0) {
+            const auto check = c->completions.complete(completion.user_ctx,
+                completion.status == URMA_CR_SUCCESS, completion.completion_len);
+            if (!check.request_retired) c->safe_to_destroy = false;
+            if (check.error != gamaq::CompletionError::none) {
+                std::fprintf(stderr, "invalid completion for submitted WR %llu: %s "
+                    "(completion_user_ctx=%llu, status=%d, expected_bytes=%u, actual_bytes=%u)\n",
+                    static_cast<unsigned long long>(wr.user_ctx),
+                    gamaq::completion_error_message(check.error),
+                    static_cast<unsigned long long>(completion.user_ctx),
+                    static_cast<int>(completion.status), check.expected_bytes,
+                    completion.completion_len);
+                return -1;
+            }
+            return 0;
+        }
+        // Busy polling is intentional for the latency benchmark. Reading the
+        // wall clock every 256 empty polls bounds overhead in the hot path.
+        if ((++polls & 0xff) == 0 && Clock::now() >= deadline) {
+            c->safe_to_destroy = false;
+            std::fprintf(stderr, "completion timeout for WR %llu after %llu ms\n",
+                static_cast<unsigned long long>(wr.user_ctx),
+                static_cast<unsigned long long>(timeout_ms));
+            return -ETIMEDOUT;
+        }
     }
-    return -1;
 }
 
 struct Result { uint64_t operations = 0, nanoseconds = 0; int status = 0; };
@@ -322,7 +374,8 @@ bool check_layout(const NpuHbmExport &remote, uint32_t threads, uint32_t size) {
 }
 
 int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remote,
-             uint32_t thread_count, uint32_t size, uint64_t warmup, uint64_t iterations) {
+             uint32_t thread_count, uint32_t size, uint64_t warmup, uint64_t iterations,
+             uint64_t completion_timeout_ms) {
     if (!check_layout(remote, thread_count, size)) return -1;
     std::vector<ThreadContext> contexts(thread_count);
     for (auto &context : contexts) {
@@ -346,13 +399,15 @@ int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remo
                 return;
             }
             for (uint64_t n = 0; n < warmup; ++n) {
-                if ((results[id].status = post_write(&contexts[id], region->address, size))) break;
+                if ((results[id].status = post_write(&contexts[id], region->address, size,
+                                                     completion_timeout_ms))) break;
             }
             gate.arrive_and_wait();
             if (results[id].status) return;
             auto begin = Clock::now();
             for (uint64_t n = 0; n < iterations; ++n) {
-                if ((results[id].status = post_write(&contexts[id], region->address, size))) break;
+                if ((results[id].status = post_write(&contexts[id], region->address, size,
+                                                     completion_timeout_ms))) break;
                 ++results[id].operations;
             }
             results[id].nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
@@ -392,7 +447,8 @@ int main(int argc, char **argv) {
     if (!parse_options(argc, argv, &options)) {
         std::fprintf(stderr, "Usage: %s [--socket PATH] [--host-eid HEX] "
                              "[--threads 1,2,4,8] [--sizes 512,1024,2048,4096] "
-                             "[--warmup N] [--iterations N]\n", argv[0]);
+                             "[--warmup N] [--iterations N] "
+                             "[--completion-timeout-ms N]\n", argv[0]);
         return 2;
     }
     int fd = connect_socket(options.socket);
@@ -417,13 +473,24 @@ int main(int argc, char **argv) {
     if (eid_index < 0) { std::fprintf(stderr, "host EID index not found\n"); return 1; }
     std::puts("threads,size_bytes,operations,gbps,mops,avg_thread_latency_us,status");
     int status = 0;
-    for (uint32_t threads : options.threads)
-        for (uint32_t size : options.sizes)
+    bool failed = false;
+    for (uint32_t threads : options.threads) {
+        for (uint32_t size : options.sizes) {
             if (run_case(device, static_cast<uint32_t>(eid_index), remote, threads, size,
-                         options.warmup, options.iterations)) status = 1;
-    // Ask the NPU to copy HBM back and print it, proving that WRITE reached HBM.
-    if (send_control(fd, ControlCommand::kHostWriteDone)) status = 1;
-    if (send_control(fd, ControlCommand::kDone)) status = 1;
+                         options.warmup, options.iterations,
+                         options.completion_timeout_ms)) {
+                status = 1;
+                failed = true;
+                break;
+            }
+        }
+        if (failed) break;
+    }
+    // Only a fully completed matrix may be presented to the NPU as valid.
+    if (!failed) {
+        if (send_control(fd, ControlCommand::kHostWriteDone)) status = 1;
+        if (send_control(fd, ControlCommand::kDone)) status = 1;
+    }
     close(fd);
     return status;
 }

@@ -80,3 +80,59 @@ git diff --check
 
 长期不变式：提交、源缓冲可复用、传输完成、对端可消费是不同事件；
 任何布局预检都不替代实际设备权限、完成语义或 HBM 映射验证。
+
+## 2026-10-02：建立 completion 所有权状态机
+
+基线：`445c24856ebbdb7371ec46918e8d68d1bef50fa9`，`codex/urmacpu`。
+同步远端并检查文件树，未发现新的 `AGENTS.md`。
+
+**问题与决定**：基线收到任意 CR 后只检查 `status`。它不核对 `user_ctx`，
+也不核对 `completion_len`；错序、陈旧或错误归属的完成可能替当前 WR “结账”。
+固定一百万次 poll 也不是时间单位，超时后仍普通销毁 context，无法证明在途 WR
+已经 drain。先建立可测试的完成所有权，再开放多 outstanding。
+
+**实现**：
+
+- 新增 SDK-independent `CompletionTracker`：post 前登记请求，拒绝零/重复 ID；
+  按 `user_ctx` 精确退休，验证状态与长度，支持未来窗口的乱序完成。
+- 单 WR post 失败会撤销登记；成功 post 后的 poll 错误、未知 CR 或墙钟超时会
+  quarantine context。参数矩阵 fail-fast，失败路径不发送成功控制命令。
+- 用默认 5 秒的 `--completion-timeout-ms` 替换固定 poll 次数，范围限制为
+  1 ms–1 h；正常路径仍 busy-poll，每 256 次空 poll 检查一次截止时间。
+- quarantine 不执行普通销毁链，资源保留到失败进程退出。它避免在未证明 drain
+  时主动释放被设备引用的缓冲，但不是常驻中间件的恢复机制。
+- 修复官方头文件语法检查发现的 const 不匹配：复制 segment 描述后传给
+  `urma_import_seg`，保留控制面原始 export 不变。
+
+**验证证据**（Linux x86_64，GCC 13.3.0，CMake 3.31.6）：
+
+```bash
+cmake -S examples -B /tmp/gamaq-tests -DBUILD_URMA_BENCH=OFF \
+  -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/gamaq-tests -j2
+ctest --test-dir /tmp/gamaq-tests --output-on-failure
+# 2/2 tests passed
+
+g++ -std=c++17 -O1 -g -Wall -Wextra -Wpedantic -Werror \
+  -fsanitize=address,undefined -fno-omit-frame-pointer -Iexamples \
+  examples/tests/completion_tracker_test.cpp -o /tmp/completion_tracker_test
+ASAN_OPTIONS=detect_leaks=0 /tmp/completion_tracker_test
+# completion_tracker: 147 checks passed
+
+g++ -std=c++17 -Wall -Wextra -Werror -pthread \
+  -isystem /tmp/umdk/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+# passed against openEuler UMDK mirror e720dbead0b6 fetched 2026-10-02
+```
+
+Completion 测试覆盖非法/重复提交、post 撤销、未知和重复 CR、状态错误、长度错误、
+64 项窗口逆序完成。加上原布局测试，本地两套测试共执行 11,641 次断言。
+官方镜像头文件编译只是 API 形状检查，不等于用户目标 CANN/URMA 版本兼容。
+
+**未验证**：目标 `/usr/include/ub/umdk/urma` 与 `/usr/lib64/liburma.so` 编译链接、
+设备 completion_len 行为、quarantine 后 provider/kernel 的退出回收、NPU 控制面 EOF
+处理以及任何性能指标均未实测。本轮不宣称性能收益。
+
+**下一步**：在用户目标 SDK/设备上先验证 W=1 的 user_ctx、completion_len 与错误
+CR；同时核实 Jetty suspend/flush/drain API。随后把同一 tracker 接到 W=2–64 的
+有界窗口，逐批 post、批量 poll，并测量有效带宽、CPU 开销和尾延迟。

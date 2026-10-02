@@ -118,7 +118,7 @@ cmake --build build/urma -j
 ```bash
 taskset -c 0-7 ./build/urma/urma_cpu_to_npu_bench \
   --threads 1,2,4,8 --sizes 512,1024,2048,4096 \
-  --warmup 1000 --iterations 100000
+  --warmup 1000 --iterations 100000 --completion-timeout-ms 5000
 ```
 
 输出列为线程数、payload、完成次数、Gb/s、Mops/s、平均线程内延迟和状态码。每组
@@ -205,3 +205,26 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
 [openEuler 24.03 LTS SP4 URMA API Guide §2.3.2.1.4](https://docs.openeuler.org/zh/docs/24.03_LTS_SP4/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)，
 查阅日期 2026-10-01；该核对不能替代目标机器匹配驱动的 SDK 编译。
 后续迭代记录见 [middleware_evolution.md](middleware_evolution.md)。
+
+## 8. Completion 所有权与失败边界
+
+每个 signaled WR 在 post 前登记 `{user_ctx, expected_bytes}`。post 失败时撤销登记；
+post 成功后，只有 `user_ctx` 命中当前在途请求、`status == URMA_CR_SUCCESS` 且
+`completion_len == expected_bytes`，才计为一次成功操作并允许复用源缓冲区。
+错误状态和长度不符会退休命中的请求但将本次操作记为失败；未知、重复或错配的
+`user_ctx` 不会替其他请求完成，context 会进入 quarantine。
+
+`--completion-timeout-ms` 默认 5000，合法范围 1–3,600,000 ms。实现使用墙钟截止
+时间而非与 CPU 速度相关的固定 poll 次数。为了避免每次空 poll 都读取时钟，
+每 256 次空 poll 检查一次截止时间；因此这是故障边界，不是精确计时器。
+poll 接口失败或超时后，已成功 post 的 WR 可能仍在设备内。公开 API 文档没有说明
+普通 `urma_delete_jetty` 会同步 drain 这些 WR，因此程序停止后续参数矩阵，跳过该
+context 的常规 unimport/delete/free 链，并且不发送 `HOST_WRITE_DONE`/`DONE` 成功
+控制命令。资源暂留到进程退出，由 provider/kernel 做最终回收；这是一种故障隔离，
+不是面向常驻服务的恢复方案。后续中间件必须基于目标 SDK 核实 suspend/flush/drain
+流程，才能在同一进程内安全恢复。
+
+完成字段语义已于 2026-10-02 核对
+[openEuler 24.03 LTS SP4 URMA API Guide 的 `urma_poll_jfc`/`urma_cr_t`](https://docs.openeuler.org/zh/docs/24.03_LTS_SP4/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)：
+`user_ctx` 对应 WR，`completion_len` 是传输字节数，状态枚举还包括 timeout、flush、
+suspend 等失败。目标机器仍应以匹配驱动版本的头文件和实际行为为准。
