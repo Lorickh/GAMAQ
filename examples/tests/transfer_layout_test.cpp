@@ -14,7 +14,9 @@ void require(bool ok, const char *message) {
 
 int main() {
     using gamaq::LayoutError;
+    using gamaq::plan_window_slot;
     using gamaq::plan_write_region;
+    using gamaq::validate_window_layout;
     using gamaq::validate_write_layout;
     constexpr auto max = std::numeric_limits<uint64_t>::max();
 
@@ -35,6 +37,12 @@ int main() {
     require(validate_write_layout(0, max, 0, 1, 1) == LayoutError::segment_too_small, "zero segment");
     require(validate_write_layout(0, max, max, max, 2) ==
             LayoutError::byte_count_overflow, "multiplication wrap");
+    require(validate_window_layout(0, max, max, max, 2, 1) ==
+            LayoutError::byte_count_overflow, "worker-slot multiplication wrap");
+    require(validate_window_layout(0, max, max, max / 2, 2, 3) ==
+            LayoutError::byte_count_overflow, "range-payload multiplication wrap");
+    require(validate_window_layout(0, max, max, 1, 0, 1) ==
+            LayoutError::empty, "zero window");
     require(validate_write_layout(max - 4094, 4096, 4096, 1, 4096) ==
             LayoutError::address_overflow, "destination last-byte wrap");
     require(validate_write_layout(max - 4095, 4096, 4096, 1, 4096) ==
@@ -70,6 +78,37 @@ int main() {
         for (uint64_t payload : {512, 1024, 2048, 4096})
             require(validate_write_layout(0x120000000000, 131072, 131072, workers,
                     payload) == LayoutError::none, "requested benchmark matrix");
+
+    // Window slots are disjoint both within a worker and across workers.
+    for (uint64_t workers : {1, 2, 4, 8}) {
+        for (uint64_t slots : {1, 2, 4, 8, 16, 32, 64}) {
+            for (uint64_t payload : {512, 1024, 2048, 4096}) {
+                const uint64_t required = workers * slots * payload;
+                require(validate_window_layout(0x200000, required, required,
+                        workers, slots, payload) == LayoutError::none,
+                        "window matrix exact fit");
+                uint64_t expected = 0;
+                for (uint64_t worker = 0; worker < workers; ++worker) {
+                    for (uint64_t slot = 0; slot < slots; ++slot) {
+                        const auto region = plan_window_slot(0x200000, required, required,
+                            workers, slots, payload, worker, slot);
+                        require(region && region->offset == expected &&
+                                region->address == 0x200000 + expected,
+                                "window slots are contiguous and unique");
+                        expected += payload;
+                    }
+                }
+                require(!plan_window_slot(0x200000, required, required, workers,
+                        slots, payload, workers, 0), "reject window worker index");
+                require(!plan_window_slot(0x200000, required, required, workers,
+                        slots, payload, 0, slots), "reject window slot index");
+                if (required > 1)
+                    require(validate_window_layout(0x200000, required - 1, required,
+                            workers, slots, payload) == LayoutError::hbm_too_small,
+                            "window layout rejects one-byte-short HBM");
+            }
+        }
+    }
 
     std::cout << "transfer_layout: " << checks << " checks passed\n";
 }

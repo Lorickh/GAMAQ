@@ -91,18 +91,23 @@ NPU server 的首包和控制命令：
 - 默认 payload 为 512、1024、2048、4096 B；线程数为 1、2、4、8。
 - 每个线程独占 context、JFC、JFR、Jetty、registered DDR 和 imported handle，
   避免在未知线程安全保证下共享队列，也能观察多队列扩展性。
-- 每个线程只保持 1 个 outstanding WR，完成轮询不 sleep。因此结果代表
-  CPU post + doorbell + completion 的同步性能。
+- `--windows` 控制每线程 outstanding WR 上限，支持 1/2/4/8/16/32/64，默认 1
+  以保留原同步基线。实现逐 WR post、最多 16 条 CR 一次 poll；本版还没有把多个
+  WR 链成一次 post，因此可分离验证“并发在途”而不是混入 doorbell batching。
+- 每个在途 WR 独占一块已注册 Host 源槽位和 NPU HBM 目标槽位。完成按 `user_ctx`
+  乱序退休，只有对应完成成功后才释放该槽，避免窗口下过早复用源缓冲。
 - 预热不计时；所有线程经 gate 同时开始；吞吐按最慢线程的 wall time 计算。
 - 为每个线程分配严格不重叠的 HBM 范围。在创建 URMA 资源及发送 WR 前，先对
-  整个参数矩阵的最大 footprint 做预检：`max(threads) * max(sizes)` 必须同时
+  整个参数矩阵的最大 footprint 做预检：
+  `max(threads) * max(windows) * max(sizes)` 必须同时
   不超过 `hbm_len` 和 `remote_seg.len`，目标最后一字节的 UBVA 不得溢出。
   容量不足直接报错退出（状态码 2），不再回退 offset 0，也不运行部分测试矩阵。
-  例如 8 KiB 只允许 2 线程×4 KiB；8 线程×4 KiB 至少需要 32 KiB，
-  32 线程×4 KiB 至少需要 128 KiB，且 NPU 端分配和注册的长度都必须满足要求。
+  例如 W=1 时 8 KiB 只允许 2 线程×4 KiB；8 线程×W64×4 KiB 至少需要 2 MiB，
+  且 NPU 端分配和注册的长度都必须满足要求。
   各 case 顺序复用同一范围；范围之间暂不增加页间隔。
-- CSV 中 `avg_thread_latency_us` 是所有线程执行时间之和除以完成操作总数；它不是
-  p50/p99。若需要分位数，应抽样记录单次延迟，避免每次记录本身扰动热路径。
+- CSV 中 `avg_completion_interval_us` 是所有线程执行时间之和除以完成操作总数。
+  W=1 时可作为线程内同步操作耗时；W>1 时是完成间隔，**不是**单 WR latency，
+  也不是 p50/p99。后续应在不扰动热路径的前提下抽样 request latency。
 
 构建（路径和库名需要按安装的 CANN/URMA SDK 调整）：
 
@@ -118,6 +123,7 @@ cmake --build build/urma -j
 ```bash
 taskset -c 0-7 ./build/urma/urma_cpu_to_npu_bench \
   --threads 1,2,4,8 --sizes 512,1024,2048,4096 \
+  --windows 1,2,4,8,16,32,64 \
   --warmup 1000 --iterations 100000 --completion-timeout-ms 5000
 ```
 
@@ -132,9 +138,10 @@ CANN/URMA 版本、EID、MTU 和 CPU governor。
 1. **线程与队列拓扑**：1/2/4/8/16 个线程；一线程一 Jetty/JFC，对比共享 JFC
    （仅在对应版本明确保证线程安全时）。线程绑到 UB/NPU 所在 NUMA node 的物理核，
    避免 SMT sibling。
-2. **同步深度**：当前 depth=1。下一阶段应实现滑动窗口 1/2/4/8/16/32/64：先 post
-   N 个 WR，再批量 poll。小包带宽通常更依赖 outstanding 数；每个 WR 请求 completion
-   的模式也可与间隔 signaled completion 比较，但必须确保 SDK 允许且正确回收 SQ。
+2. **同步深度**：当前已有滑动窗口 1/2/4/8/16/32/64，逐 WR post 后批量 poll。
+   下一阶段先在实机确认最优窗口与 CPU 开销，再单独比较 WR 链式批量 post；每个 WR
+   请求 completion 的模式也可与间隔 signaled completion 比较，但必须确保 SDK
+   允许且能正确回收发送队列。
 3. **CQ/JFC**：CQ depth 至少覆盖窗口和线程使用方式，不要无条件设为设备最大值。
    比较 busy poll、事件通知；事件适合降低 CPU 占用，busy poll 适合测最低延迟。
 4. **Jetty/QP**：RM、priority、`rnrRetry`、`errTimeout`、多路径与 error suspend
@@ -176,8 +183,8 @@ CQ depth、Jetty mode 和销毁 API。
 ## 7. 无 URMA SDK 的边界验证
 
 `examples/transfer_layout.h` 是无设备依赖的布局检查，不是传输后端。
-其数值契约为：每个线程拥有连续的 `size` 字节范围，所有线程的总 footprint
-同时受 HBM 与注册 segment 的长度约束。V1 协议仍要求 HBM 起始字节对应
+其数值契约为：每个线程拥有 `window` 个连续、互不重叠的 `size` 字节槽位，所有
+线程的总 footprint 同时受 HBM 与注册 segment 的长度约束。V1 协议仍要求 HBM 起始字节对应
 `remote_seg.ubva.va`；`hbm_ptr` 不作为 CPU 可解引用地址，也不能仅靠数值检查
 证明两个地址空间的映射或对端元数据真实性。预检失败时 Host 关闭控制连接；
 原 NPU server 应处理 EOF 并释放资源，不会收到 WRITE_DONE/DONE。
@@ -196,8 +203,10 @@ g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
 /tmp/transfer_layout_test
 ```
 
-这些测试验证数值边界和布局隔离，不验证 SDK ABI、设备传输、HBM 数据一致性或性能。
-正常 benchmark 构建仍默认开启；CSV 列和有效配置下的地址计算保持不变。
+这些测试验证数值边界、窗口上限、乱序槽位复用和布局隔离，不验证 SDK ABI、设备
+传输、HBM 数据一致性或性能。
+正常 benchmark 构建仍默认开启；W=1 保留原有效地址布局，但 CSV 新增 `window`，
+并将最后一个计时列改为语义更准确的 `avg_completion_interval_us`。
 默认线程/大小矩阵对 8 KiB NPU 分配现在会明确拒绝，需要扩充并重新注册 HBM，
 或显式使用 `--threads 1,2`。
 
@@ -228,3 +237,23 @@ context 的常规 unimport/delete/free 链，并且不发送 `HOST_WRITE_DONE`/`
 [openEuler 24.03 LTS SP4 URMA API Guide 的 `urma_poll_jfc`/`urma_cr_t`](https://docs.openeuler.org/zh/docs/24.03_LTS_SP4/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)：
 `user_ctx` 对应 WR，`completion_len` 是传输字节数，状态枚举还包括 timeout、flush、
 suspend 等失败。目标机器仍应以匹配驱动版本的头文件和实际行为为准。
+
+## 9. 有界滑动窗口契约
+
+窗口状态机把 `request_id -> {expected_bytes, source_slot}` 作为最小所有权单元。
+窗口满时不再 post；CR 可以乱序到达，但只能释放其 `user_ctx` 对应的槽位。单 WR
+post 失败会撤销尚未交给 provider 的当前槽位；若此前已有 WR 在途，则停止继续下发，
+并由既有 quarantine 规则保留上下文。poll 错误、未知 CR 和超时同样停止整个矩阵。
+任一 worker 失败会发布全局 stop；其他 worker 不再 post，但会继续 poll，直到已提交
+请求全部退休后返回取消，从而尽量减少跨线程失败留下的未知在途资源。
+
+每个 case 的 JFS depth 等于窗口，JFC depth 等于 `window + 1`，额外一项用于一个
+关联 Jetty 的异步错误 CR；若设备查询到的 `max_jfs_depth`、`max_jfc_depth` 或
+`max_jfr_depth` 不满足要求，就显式拒绝该 case。这个配置依据 2026-10-03 查阅的
+[openEuler 24.03 LTS SP3 URMA API Guide](https://docs.openeuler.org/zh/docs/24.03_LTS_SP3/unifiedbus/unifiedbus/urma/URMA%20API%20Guide.ch.html)：
+文档建议 JFC depth 至少覆盖关联发送队列产生的 CR，再为每个关联 Jetty 预留一项；
+`urma_poll_jfc` 对 RDMA device 单次最多返回 16 条 CR。
+
+SDK-independent reference 测试对 W=1–64 各运行 1024 次非 FIFO 完成，检查在途量不
+超过窗口、忙槽不被复用、完成只释放匹配槽。真实 provider 是否保证所需 completion
+字段、窗口对应的队列能力以及实际吞吐/CPU 收益仍须目标 CANN 9.1 与 NPU/UB 实机验证。

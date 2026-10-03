@@ -136,3 +136,52 @@ Completion 测试覆盖非法/重复提交、post 撤销、未知和重复 CR、
 **下一步**：在用户目标 SDK/设备上先验证 W=1 的 user_ctx、completion_len 与错误
 CR；同时核实 Jetty suspend/flush/drain API。随后把同一 tracker 接到 W=2–64 的
 有界窗口，逐批 post、批量 poll，并测量有效带宽、CPU 开销和尾延迟。
+
+## 2026-10-03：有界滑动窗口与独立数据槽
+
+基线：`7a999d981b5e0a64c96d56ec0adebc9483037978`，`codex/urmacpu`。
+
+**场景假设**：KV cache prefetch/offload 会连续搬运多个离散块。W=1 把每次 post
+和 completion 串行化，无法重叠设备/链路延迟；但只增加在途数而复用同一源缓冲会
+破坏源缓冲可复用契约。最高优先级增量是先建立 W=1–64 的有界窗口和独立数据槽，
+保持 W=1 对照，再由实机决定收益与最优窗口。
+
+**架构决定与实现**：
+
+- `CompletionTracker` 同时管理请求归属和固定容量 source slot；窗口满则背压，
+  乱序 CR 只释放匹配 `user_ctx` 的槽，post 失败仅撤销未提交请求。
+- benchmark 新增 `--windows`。每线程注册 `window * payload` 的 Host buffer，NPU
+  目标布局扩展为 `threads * window * payload`，避免并发写共享目的地址。
+- 热路径逐 WR post、最多批量 poll 16 条 CR，完成后立即补满窗口。故障后停止新
+  post；其他 worker drain 已提交请求，出错 worker 的未知在途资源继续进入
+  quarantine。尚未实现 WR 链式批量 post。
+- JFS depth=`window`，JFC depth=`window+1`，JFR depth=1；能力不足显式拒绝。
+  CSV 增加 window，并把易误解的 latency 列改名为 completion interval。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/completion_tracker_test.cpp -o /tmp/completion && /tmp/completion
+# completion_tracker: 36134 checks passed
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/transfer_layout_test.cpp -o /tmp/layout && /tmp/layout
+# transfer_layout: 19565 checks passed
+
+# 两个测试同样以 ASan/UBSan 运行通过（ASAN_OPTIONS=detect_leaks=0）
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -isystem /tmp/umdk-day3/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+# passed against openEuler UMDK mirror e720dbead0b6 fetched 2026-10-03
+```
+
+两套测试合计 55,699 次断言；其中 reference scheduler 对七档窗口各执行 1,024 次
+非 FIFO 完成。这里的断言数不是实机测试数。当前环境没有 CMake，因而改用等价的
+直接编译/运行；sanitizer 未启用 leak 检查。
+
+**未验证与下一步**：没有目标 CANN 9.1、NPU/UB 设备，未验证真实 SDK 编译链接、
+completion 行为、数据一致性、吞吐或 CPU 收益。下一轮优先补充可注入 post/poll
+部分失败的 backend seam 与窗口调度测试，随后在实机采集 W=1–64、512–4096 B、
+线程 1–32 的 Gb/s、Mops/s、CPU core-seconds/GB 和尾延迟，依据数据决定是否做
+链式 post、自适应窗口或公平调度。
