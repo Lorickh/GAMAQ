@@ -27,6 +27,7 @@
 #include "urma_api.h"
 #include "completion_tracker.h"
 #include "transfer_layout.h"
+#include "window_scheduler.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -34,7 +35,6 @@ constexpr uint32_t kMagic = 0x48424D55;
 constexpr uint32_t kVersion = 1;
 constexpr uint64_t kPageSize = 4096;
 constexpr uint32_t kMaxWindow = 64;
-constexpr int kMaxPollBatch = 16;
 
 enum class ControlCommand : uint32_t { kHostWriteDone = 1, kFillHbm = 2, kDone = 3 };
 
@@ -300,116 +300,100 @@ int create_context(urma_device_t *device, uint32_t eid_index, uint32_t size,
     return c->remote_jetty ? 0 : -1;
 }
 
+class UrmaWriteBackend {
+public:
+    UrmaWriteBackend(ThreadContext *context, uint64_t remote_base, uint32_t payload)
+        : c_(context), remote_base_(remote_base), payload_(payload) {}
+
+    int post(gamaq::TransferRequest request) {
+        const uint64_t slot_offset = uint64_t{request.slot} * payload_;
+        urma_sge_t local {};
+        local.addr = reinterpret_cast<uint64_t>(c_->buffer) + slot_offset;
+        local.len = request.bytes;
+        local.tseg = c_->local_seg;
+        urma_sge_t target {};
+        target.addr = remote_base_ + slot_offset;
+        target.len = request.bytes;
+        target.tseg = c_->remote_seg;
+        urma_sg_t src {&local, 1};
+        urma_sg_t dst {&target, 1};
+        urma_rw_wr_t rw {};
+        rw.src = src;
+        rw.dst = dst;
+        urma_jfs_wr_t wr {};
+        wr.opcode = URMA_OPC_WRITE;
+        wr.flag.bs.complete_enable = 1;
+        wr.tjetty = c_->remote_jetty;
+        wr.user_ctx = request.request_id;
+        wr.rw = rw;
+        urma_jfs_wr_t *bad = nullptr;
+        return urma_post_jetty_send_wr(c_->jetty, &wr, &bad);
+    }
+
+    int poll(gamaq::TransferCompletion *out, int max_count) {
+        std::array<urma_cr_t, gamaq::kMaxCompletionBatch> completions {};
+        const int count = urma_poll_jfc(c_->jfc, max_count, completions.data());
+        if (count <= 0) return count;
+        if (count > max_count) return count;
+        for (int i = 0; i < count; ++i) {
+            const auto &completion = completions[static_cast<size_t>(i)];
+            out[i] = {completion.user_ctx, completion.completion_len,
+                      static_cast<int>(completion.status),
+                      completion.status == URMA_CR_SUCCESS};
+        }
+        return count;
+    }
+
+private:
+    ThreadContext *c_;
+    uint64_t remote_base_;
+    uint32_t payload_;
+};
+
+int window_result_status(const gamaq::WindowRunResult &result) {
+    switch (result.error) {
+    case gamaq::WindowError::none: return 0;
+    case gamaq::WindowError::canceled: return -ECANCELED;
+    case gamaq::WindowError::request_id_exhausted: return -EOVERFLOW;
+    case gamaq::WindowError::timeout: return -ETIMEDOUT;
+    case gamaq::WindowError::post_error:
+    case gamaq::WindowError::poll_error:
+        return result.backend_status ? result.backend_status : -1;
+    default: return -1;
+    }
+}
+
 int run_write_window(ThreadContext *c, uint64_t remote_worker_base, uint32_t size,
                      uint64_t operations, uint64_t timeout_ms,
                      std::atomic<bool> *stop, uint64_t *completed_operations) {
-    *completed_operations = 0;
-    auto fail = [stop](int status) {
-        stop->store(true, std::memory_order_relaxed);
-        return status;
-    };
-    auto deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-    uint64_t submitted = 0;
-    uint64_t polls = 0;
-    while (*completed_operations < operations) {
-        const bool stopping = stop->load(std::memory_order_relaxed);
-        if (stopping && c->completions.empty()) return -ECANCELED;
-        while (!stop->load(std::memory_order_relaxed) && submitted < operations &&
-               c->completions.can_submit()) {
-            if (c->request_id == UINT64_MAX) {
-                std::fprintf(stderr, "WR request id exhausted\n");
-                return fail(-EOVERFLOW);
-            }
-            const uint64_t request_id = ++c->request_id;
-            const auto reservation = c->completions.reserve(request_id, size);
-            if (reservation.error != gamaq::CompletionError::none) {
-                std::fprintf(stderr, "cannot reserve WR %llu: %s\n",
-                    static_cast<unsigned long long>(request_id),
-                    gamaq::completion_error_message(reservation.error));
-                return fail(-1);
-            }
-            const uint64_t slot_offset = uint64_t{reservation.slot} * size;
-            urma_sge_t local {};
-            local.addr = reinterpret_cast<uint64_t>(c->buffer) + slot_offset;
-            local.len = size;
-            local.tseg = c->local_seg;
-            urma_sge_t target {};
-            target.addr = remote_worker_base + slot_offset;
-            target.len = size;
-            target.tseg = c->remote_seg;
-            urma_sg_t src {&local, 1};
-            urma_sg_t dst {&target, 1};
-            urma_rw_wr_t rw {};
-            rw.src = src;
-            rw.dst = dst;
-            urma_jfs_wr_t wr {};
-            wr.opcode = URMA_OPC_WRITE;
-            wr.flag.bs.complete_enable = 1;
-            wr.tjetty = c->remote_jetty;
-            wr.user_ctx = request_id;
-            wr.rw = rw;
-            urma_jfs_wr_t *bad = nullptr;
-            const int rc = urma_post_jetty_send_wr(c->jetty, &wr, &bad);
-            if (rc) {
-                c->completions.cancel_unposted(request_id);
-                std::fprintf(stderr, "urma_post_jetty_send_wr failed for WR %llu: %d\n",
-                    static_cast<unsigned long long>(request_id), rc);
-                return fail(rc);
-            }
-            ++submitted;
-        }
+    UrmaWriteBackend backend(c, remote_worker_base, size);
+    const auto result = gamaq::run_bounded_window(c->completions, c->request_id, size,
+        operations, std::chrono::milliseconds(timeout_ms), *stop, backend);
+    *completed_operations = result.completed;
+    if (result.error == gamaq::WindowError::none) return 0;
+    if (!result.safe_to_destroy()) c->safe_to_destroy = false;
 
-        std::array<urma_cr_t, kMaxPollBatch> completions {};
-        const int requested = std::min<int>(kMaxPollBatch,
-            static_cast<int>(c->completions.in_flight()));
-        if (!requested)
-            return stop->load(std::memory_order_relaxed) ? -ECANCELED : fail(-1);
-        const int count = urma_poll_jfc(c->jfc, requested, completions.data());
-        if (count < 0) {
-            c->safe_to_destroy = false;
-            std::fprintf(stderr, "urma_poll_jfc failed with %zu WR(s) in flight: %d\n",
-                c->completions.in_flight(), count);
-            return fail(count);
-        }
-        if (count > requested) {
-            c->safe_to_destroy = false;
-            std::fprintf(stderr, "urma_poll_jfc returned %d CRs into a %d-entry request\n",
-                         count, requested);
-            return fail(-1);
-        }
-        if (count) {
-            for (int i = 0; i < count; ++i) {
-                const auto &completion = completions[static_cast<size_t>(i)];
-                const auto check = c->completions.complete(completion.user_ctx,
-                    completion.status == URMA_CR_SUCCESS, completion.completion_len);
-                if (!check.request_retired) c->safe_to_destroy = false;
-                if (check.error != gamaq::CompletionError::none) {
-                    std::fprintf(stderr, "invalid completion: %s "
-                        "(user_ctx=%llu, status=%d, expected_bytes=%u, actual_bytes=%u)\n",
-                        gamaq::completion_error_message(check.error),
-                        static_cast<unsigned long long>(completion.user_ctx),
-                        static_cast<int>(completion.status), check.expected_bytes,
-                        completion.completion_len);
-                    return fail(-1);
-                }
-                ++*completed_operations;
-            }
-            deadline = Clock::now() + std::chrono::milliseconds(timeout_ms);
-            polls = 0;
-            continue;
-        }
-        // Busy polling is intentional. Reading the wall clock every 256 empty
-        // polls bounds overhead; every successful batch refreshes the stall
-        // deadline, so a long healthy run does not time out.
-        if ((++polls & 0xff) == 0 && Clock::now() >= deadline) {
-            c->safe_to_destroy = false;
-            std::fprintf(stderr, "completion stalled with %zu WR(s) in flight after %llu ms\n",
-                c->completions.in_flight(),
-                static_cast<unsigned long long>(timeout_ms));
-            return fail(-ETIMEDOUT);
-        }
-    }
-    return 0;
+    std::fprintf(stderr, "WRITE window failed: %s (submitted=%llu, completed=%llu, "
+        "in_flight=%zu, drained=%d)", gamaq::window_error_message(result.error),
+        static_cast<unsigned long long>(result.submitted),
+        static_cast<unsigned long long>(result.completed), result.in_flight,
+        result.drained ? 1 : 0);
+    if (result.error == gamaq::WindowError::post_error ||
+        result.error == gamaq::WindowError::poll_error)
+        std::fprintf(stderr, ", backend_status=%d", result.backend_status);
+    if (result.error == gamaq::WindowError::invalid_completion ||
+        result.drain_error == gamaq::WindowError::invalid_completion)
+        std::fprintf(stderr, ", completion=%s, user_ctx=%llu, status=%d, "
+            "expected_bytes=%u, actual_bytes=%u",
+            gamaq::completion_error_message(result.completion_error),
+            static_cast<unsigned long long>(result.request_id),
+            result.completion_status, result.expected_bytes, result.actual_bytes);
+    if (result.drain_error != gamaq::WindowError::none)
+        std::fprintf(stderr, ", drain_error=%s, drain_status=%d",
+            gamaq::window_error_message(result.drain_error),
+            result.drain_backend_status);
+    std::fputc('\n', stderr);
+    return window_result_status(result);
 }
 
 struct Result { uint64_t operations = 0, nanoseconds = 0; int status = 0; };

@@ -22,6 +22,11 @@ if(BUILD_TESTING)
     target_include_directories(completion_tracker_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(completion_tracker_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME completion_tracker COMMAND completion_tracker_test)
+
+    add_executable(window_scheduler_test tests/window_scheduler_test.cpp)
+    target_include_directories(window_scheduler_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(window_scheduler_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME window_scheduler COMMAND window_scheduler_test)
 endif()
 
 # Example when the CANN/URMA headers and libraries are not in system paths:

@@ -242,8 +242,9 @@ suspend 等失败。目标机器仍应以匹配驱动版本的头文件和实际
 
 窗口状态机把 `request_id -> {expected_bytes, source_slot}` 作为最小所有权单元。
 窗口满时不再 post；CR 可以乱序到达，但只能释放其 `user_ctx` 对应的槽位。单 WR
-post 失败会撤销尚未交给 provider 的当前槽位；若此前已有 WR 在途，则停止继续下发，
-并由既有 quarantine 规则保留上下文。poll 错误、未知 CR 和超时同样停止整个矩阵。
+post 失败会撤销尚未交给 provider 的当前槽位、停止继续下发，并继续 poll 此前已被
+provider 接受的 WR；全部正常退休后允许释放上下文。drain 中再次 poll 失败、未知
+CR 或超时仍进入 quarantine，且不会用“最初的 post 错误”掩盖 drain 的二次错误。
 任一 worker 失败会发布全局 stop；其他 worker 不再 post，但会继续 poll，直到已提交
 请求全部退休后返回取消，从而尽量减少跨线程失败留下的未知在途资源。
 
@@ -257,3 +258,28 @@ post 失败会撤销尚未交给 provider 的当前槽位；若此前已有 WR �
 SDK-independent reference 测试对 W=1–64 各运行 1024 次非 FIFO 完成，检查在途量不
 超过窗口、忙槽不被复用、完成只释放匹配槽。真实 provider 是否保证所需 completion
 字段、窗口对应的队列能力以及实际吞吐/CPU 收益仍须目标 CANN 9.1 与 NPU/UB 实机验证。
+
+## 10. 可复用窗口调度与 backend 边界
+
+`window_scheduler.h` 把窗口引擎从 URMA 结构体中分离。backend 只实现两个同步调用：
+
+- `post(TransferRequest)`：接收 `{request_id, slot, bytes}`；返回 0 才表示 provider
+  接受当前请求，非零状态不允许调度器假设请求在途或进行无依据重试。
+- `poll(TransferCompletion*, max_count)`：返回标准化的 request ID、长度、传输状态；
+  负数表示本次 poll 失败，返回数不能超过 `max_count`。
+
+窗口容量、request ID、槽位生命周期、背压、全局 stop、completion 校验、进展超时
+与 drain 均由公共调度器负责。`UrmaWriteBackend` 只构造 URMA SGE/WR、调用 post/poll
+并标准化 CR。该边界使用 C++ 模板静态绑定，不在 post/poll 热路径引入虚函数或
+`std::function` 间接调用；是否真正降低或保持 CPU 开销仍需实机 profile。
+
+状态机保留 primary error 与 drain error。例如第 3 次 post 失败时，请求 1、2 如果
+已经被接受，就停止补充窗口并等待它们完成；若随后 poll 又失败，结果同时保留 post
+和 drain 状态，且上下文不可销毁。已知 request 的错误 CR 会退休对应槽并 drain 其余
+请求；未知 request、poll 失败、非法 completion 数和超时无法证明 quiescence，继续
+fail-closed quarantine。
+
+mock backend 覆盖 W=1–64 的 7,168 次乱序成功完成，以及部分 post 失败、取消、传输
+错误、短 completion、未知/重复归属、poll 错误、非法返回数、确定性超时和 request ID
+耗尽。它验证调度契约而非 URMA ABI 或 NPU 数据可见性；“传输完成”仍不自动等于
+“对端计算可消费”，后者需要目标 SDK/设备协议给出额外同步证据。

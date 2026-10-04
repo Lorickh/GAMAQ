@@ -185,3 +185,53 @@ completion 行为、数据一致性、吞吐或 CPU 收益。下一轮优先补�
 部分失败的 backend seam 与窗口调度测试，随后在实机采集 W=1–64、512–4096 B、
 线程 1–32 的 Gb/s、Mops/s、CPU core-seconds/GB 和尾延迟，依据数据决定是否做
 链式 post、自适应窗口或公平调度。
+
+## 2026-10-04：抽出 backend seam，证明部分失败后的 drain
+
+基线：`f131d1afffb3334fbdec718b0b04f4052387c5f9`，`codex/urmacpu`。
+
+**场景假设**：KV 批量 prefetch/put 的窗口中，某次 post 失败不代表此前已接受的 WR
+也失败。若立即销毁会破坏所有权，若一律 quarantine 又无法成为常驻中间件。最高
+优先级是把窗口状态机与 URMA 调用解耦，明确“不重试当前请求、停止新 post、drain
+已接受请求”的边界，并在无硬件环境注入部分失败。
+
+**架构决定与实现**：
+
+- 新增模板化 `window_scheduler.h`，公共层拥有窗口/槽位、request ID、背压、stop、
+  completion 校验、超时和 drain；backend 只有 `post` 与 `poll`，无虚调用。
+- `UrmaWriteBackend` 负责地址槽到 SGE/WR 的映射及 CR 标准化；benchmark 复用同一
+  scheduler，不再内嵌调度策略。
+- post 失败仅撤销当前未接受请求，保留原错误并 drain 之前的请求；drain 再失败时
+  同时记录 secondary error。已知错误 CR 可精确退休，未知 CR/poll 错误/超时继续
+  quarantine；不假设写操作可幂等重试。
+- 新增 deterministic mock backend，能注入 post、poll、completion、长度、未知 ID、
+  非法 count、超时、跨 worker cancel 和 request-ID exhaustion。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/window_scheduler_test.cpp -o /tmp/window && /tmp/window
+# window_scheduler: 86 checks passed; W=1..64 共 7168 次成功完成
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/completion_tracker_test.cpp -o /tmp/completion && /tmp/completion
+# completion_tracker: 36134 checks passed
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+  examples/tests/transfer_layout_test.cpp -o /tmp/layout && /tmp/layout
+# transfer_layout: 19565 checks passed
+
+# 三套测试同样以 ASan/UBSan 运行；LeakSanitizer 关闭
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -isystem /tmp/umdk-day3/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+# passed against openEuler UMDK mirror e720dbead0b6 fetched 2026-10-04
+```
+
+三套测试合计 55,785 次显式断言；操作数与断言数不是实机测试数。当前环境没有目标
+CANN 9.1、NPU/UB，未验证链接、设备 quiescence、HBM 可见性、吞吐或 CPU 开销。
+
+**下一步**：当前 scheduler 仍面向单段、固定大小 WRITE。下一轮优先定义最小异步
+搬运请求/完成 API 和多块 KV batch adapter，用 reference backend 验证一批请求的
+逐项成功/失败结果、提交完成与对端可消费边界；实机可用后再做 W/线程/payload 扫描。
