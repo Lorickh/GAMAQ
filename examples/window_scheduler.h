@@ -16,7 +16,18 @@ constexpr int kMaxCompletionBatch = 16;
 
 struct TransferRequest {
     uint64_t request_id = 0;
+    uint64_t operation_index = 0;
+    uint64_t application_tag = 0;
+    uint64_t source_offset = 0;
+    uint64_t destination_offset = 0;
     uint32_t slot = 0;
+    uint32_t bytes = 0;
+};
+
+struct TransferWork {
+    uint64_t application_tag = 0;
+    uint64_t source_offset = 0;
+    uint64_t destination_offset = 0;
     uint32_t bytes = 0;
 };
 
@@ -30,6 +41,7 @@ struct TransferCompletion {
 enum class WindowError {
     none,
     canceled,
+    invalid_request,
     request_id_exhausted,
     tracker_error,
     post_error,
@@ -43,6 +55,7 @@ inline const char *window_error_message(WindowError error) {
     switch (error) {
     case WindowError::none: return "ok";
     case WindowError::canceled: return "window canceled by another worker";
+    case WindowError::invalid_request: return "transfer request has zero bytes";
     case WindowError::request_id_exhausted: return "request id space exhausted";
     case WindowError::tracker_error: return "completion tracker rejected a request";
     case WindowError::post_error: return "backend post failed";
@@ -73,19 +86,38 @@ struct WindowRunResult {
     bool safe_to_destroy() const { return ownership_known && drained; }
 };
 
+class NullTransferObserver {
+public:
+    void on_posted(const TransferRequest &) {}
+    void on_post_failed(const TransferRequest &, int) {}
+    void on_completion(uint64_t, uint64_t, CompletionError, int, uint32_t, uint32_t) {}
+    void on_unmatched_completion(const TransferCompletion &) {}
+};
+
+class FixedTransferSource {
+public:
+    explicit FixedTransferSource(uint32_t bytes) : bytes_(bytes) {}
+    TransferWork operator()(uint64_t) const { return {0, 0, 0, bytes_}; }
+
+private:
+    uint32_t bytes_;
+};
+
 // Backend is a zero-overhead compile-time boundary with two operations:
 //   int post(TransferRequest)
 //   int poll(TransferCompletion *out, int max_count)
 // A nonzero post status means the current request was not accepted. A
 // negative poll status means no completion in that call can be consumed.
-template <typename Backend, typename Clock = std::chrono::steady_clock>
-WindowRunResult run_bounded_window(CompletionTracker &tracker,
-                                   uint64_t &next_request_id,
-                                   uint32_t bytes,
-                                   uint64_t operations,
-                                   std::chrono::milliseconds timeout,
-                                   std::atomic<bool> &stop,
-                                   Backend &backend) {
+template <typename Backend, typename WorkSource, typename Observer,
+          typename Clock = std::chrono::steady_clock>
+WindowRunResult run_bounded_requests(CompletionTracker &tracker,
+                                     uint64_t &next_request_id,
+                                     uint64_t operations,
+                                     std::chrono::milliseconds timeout,
+                                     std::atomic<bool> &stop,
+                                     Backend &backend,
+                                     WorkSource &source,
+                                     Observer &observer) {
     WindowRunResult result;
     auto deadline = Clock::now() + timeout;
     uint64_t empty_polls = 0;
@@ -121,21 +153,33 @@ WindowRunResult run_bounded_window(CompletionTracker &tracker,
                 break;
             }
             const uint64_t request_id = ++next_request_id;
-            const auto reservation = tracker.reserve(request_id, bytes);
+            const uint64_t operation_index = result.submitted;
+            const TransferWork work = source(operation_index);
+            if (!work.bytes) {
+                result.request_id = request_id;
+                publish_error(WindowError::invalid_request);
+                break;
+            }
+            const auto reservation = tracker.reserve(request_id, work.bytes,
+                                                       operation_index);
             if (reservation.error != CompletionError::none) {
                 result.completion_error = reservation.error;
                 result.request_id = request_id;
                 publish_error(WindowError::tracker_error);
                 break;
             }
-            const int status = backend.post(
-                TransferRequest{request_id, reservation.slot, bytes});
+            const TransferRequest request {request_id, operation_index,
+                work.application_tag, work.source_offset, work.destination_offset,
+                reservation.slot, work.bytes};
+            const int status = backend.post(request);
             if (status) {
                 tracker.cancel_unposted(request_id);
                 result.request_id = request_id;
+                observer.on_post_failed(request, status);
                 publish_error(WindowError::post_error, status);
                 break;
             }
+            observer.on_posted(request);
             ++result.submitted;
         }
 
@@ -172,6 +216,7 @@ WindowRunResult run_bounded_window(CompletionTracker &tracker,
                 const auto check = tracker.complete(completion.request_id,
                     completion.success, completion.bytes);
                 if (!check.request_retired) {
+                    observer.on_unmatched_completion(completion);
                     result.completion_error = check.error;
                     result.completion_status = completion.transport_status;
                     result.request_id = completion.request_id;
@@ -180,6 +225,9 @@ WindowRunResult run_bounded_window(CompletionTracker &tracker,
                     result.ownership_known = false;
                     return finish();
                 }
+                observer.on_completion(check.user_context, completion.request_id,
+                    check.error, completion.transport_status, check.expected_bytes,
+                    completion.bytes);
                 if (check.error != CompletionError::none) {
                     if (result.completion_error == CompletionError::none) {
                         result.completion_error = check.error;
@@ -206,6 +254,44 @@ WindowRunResult run_bounded_window(CompletionTracker &tracker,
             return finish();
         }
     }
+}
+
+template <typename Backend, typename Clock = std::chrono::steady_clock>
+WindowRunResult run_bounded_window(CompletionTracker &tracker,
+                                   uint64_t &next_request_id,
+                                   uint32_t bytes,
+                                   uint64_t operations,
+                                   std::chrono::milliseconds timeout,
+                                   std::atomic<bool> &stop,
+                                   Backend &backend) {
+    FixedTransferSource source(bytes);
+    NullTransferObserver observer;
+    return run_bounded_requests<Backend, FixedTransferSource, NullTransferObserver, Clock>(
+        tracker, next_request_id, operations, timeout, stop, backend, source, observer);
+}
+
+class ArrayTransferSource {
+public:
+    explicit ArrayTransferSource(const TransferWork *work) : work_(work) {}
+    TransferWork operator()(uint64_t index) const { return work_[index]; }
+
+private:
+    const TransferWork *work_;
+};
+
+template <typename Backend, typename Observer,
+          typename Clock = std::chrono::steady_clock>
+WindowRunResult run_bounded_batch(CompletionTracker &tracker,
+                                  uint64_t &next_request_id,
+                                  const TransferWork *work,
+                                  uint64_t work_count,
+                                  std::chrono::milliseconds timeout,
+                                  std::atomic<bool> &stop,
+                                  Backend &backend,
+                                  Observer &observer) {
+    ArrayTransferSource source(work);
+    return run_bounded_requests<Backend, ArrayTransferSource, Observer, Clock>(
+        tracker, next_request_id, work_count, timeout, stop, backend, source, observer);
 }
 
 }  // namespace gamaq

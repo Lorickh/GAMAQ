@@ -37,6 +37,7 @@ struct CompletionCheck {
     bool request_retired = false;
     uint32_t expected_bytes = 0;
     uint32_t slot = 0;
+    uint64_t user_context = 0;
 };
 
 struct SubmissionReservation {
@@ -62,7 +63,8 @@ public:
         return true;
     }
 
-    SubmissionReservation reserve(uint64_t request_id, uint32_t bytes) {
+    SubmissionReservation reserve(uint64_t request_id, uint32_t bytes,
+                                  uint64_t user_context = 0) {
         if (!request_id || !bytes)
             return {CompletionError::invalid_request, 0};
         if (!capacity_)
@@ -73,7 +75,7 @@ public:
             return {CompletionError::window_full, 0};
         const uint32_t slot = free_slots_.back();
         free_slots_.pop_back();
-        pending_.emplace(request_id, Pending{bytes, slot});
+        pending_.emplace(request_id, Pending{bytes, slot, user_context});
         return {CompletionError::none, slot};
     }
 
@@ -90,15 +92,18 @@ public:
                              uint32_t completion_bytes) {
         auto item = pending_.find(request_id);
         if (item == pending_.end())
-            return {CompletionError::unknown_request, false, 0, 0};
+            return {CompletionError::unknown_request, false, 0, 0, 0};
         const Pending pending = item->second;
         free_slots_.push_back(pending.slot);
         pending_.erase(item);
         if (!transport_success)
-            return {CompletionError::transport_error, true, pending.bytes, pending.slot};
+            return {CompletionError::transport_error, true, pending.bytes, pending.slot,
+                    pending.user_context};
         if (completion_bytes != pending.bytes)
-            return {CompletionError::length_mismatch, true, pending.bytes, pending.slot};
-        return {CompletionError::none, true, pending.bytes, pending.slot};
+            return {CompletionError::length_mismatch, true, pending.bytes, pending.slot,
+                    pending.user_context};
+        return {CompletionError::none, true, pending.bytes, pending.slot,
+                pending.user_context};
     }
 
     size_t in_flight() const { return pending_.size(); }
@@ -107,7 +112,7 @@ public:
     uint32_t capacity() const { return capacity_; }
 
 private:
-    struct Pending { uint32_t bytes; uint32_t slot; };
+    struct Pending { uint32_t bytes; uint32_t slot; uint64_t user_context; };
     uint32_t capacity_ = 0;
     std::vector<uint32_t> free_slots_;
     std::unordered_map<uint64_t, Pending> pending_;

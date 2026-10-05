@@ -283,3 +283,33 @@ mock backend 覆盖 W=1–64 的 7,168 次乱序成功完成，以及部分 post
 错误、短 completion、未知/重复归属、poll 错误、非法返回数、确定性超时和 request ID
 耗尽。它验证调度契约而非 URMA ABI 或 NPU 数据可见性；“传输完成”仍不自动等于
 “对端计算可消费”，后者需要目标 SDK/设备协议给出额外同步证据。
+
+## 11. 首个应用适配器：离散 KV block 批量 put
+
+`kv_put_batch.h` 定义首个窄业务接口：把调用者已经注册的 CPU region 中多个离散
+KV block 写到已经注册/导入的 NPU region。每项使用 `{block_id, source_offset,
+destination_offset, bytes}`；offset 只相对于两个 region，不是可由另一地址空间直接
+解引用的指针。该层不负责 KV key 查询、内存分配/注册、地址空间转换或对端通知。
+当前只定义 CPU→NPU put/offload，不据此声称支持 get、NPU→NPU、远端 CPU 或 SSD。
+
+提交任何请求之前，adapter 对整个 batch 执行 fail-fast 验证：长度非零，源/目标地址
+加法不溢出，范围不超过各自注册区，block ID 唯一，目标范围互不重叠。只读源范围
+允许被多个 block 共享；重叠目标会产生不明确的最终内容，因此拒绝。验证失败不调用
+backend，也不产生部分提交。
+
+每个 `KvPutItemResult` 明确区分：
+
+- `not_submitted`：未交给 backend，源仍可复用；
+- `submitted`：backend 可能仍引用源，不能复用；
+- `transfer_complete`：命名 completion 成功，源可复用且传输完成；
+- `post_failed`：当前请求未被接受，源可复用，后续项不再提交；
+- `completion_failed`：命名请求已退休但传输失败，源可复用，不算成功传输。
+
+所有状态的 `peer_consumable_proven` 当前都保持 false。单边 WRITE completion 与 CPU
+load/store 内存语义、NPU kernel 可消费事件严格分离；后续必须增加目标 SDK 支持的
+可见性/通知协议，才能由应用显式推进该状态。API 不自动重试失败 block，因为当前
+没有调用者提供的幂等性或版本条件。
+
+reference-memory backend 验证离散 offset 实际复制、W=2 背压、乱序完成、共享只读
+源、逐项状态、部分 post 失败、poll 失败、错误/短 completion 和全部输入边界。
+这些结果验证 API 契约，不代表 URMA SGL、设备数据可见性或实机性能已经验证。

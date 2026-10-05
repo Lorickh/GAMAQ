@@ -235,3 +235,57 @@ CANN 9.1、NPU/UB，未验证链接、设备 quiescence、HBM 可见性、吞吐
 **下一步**：当前 scheduler 仍面向单段、固定大小 WRITE。下一轮优先定义最小异步
 搬运请求/完成 API 和多块 KV batch adapter，用 reference backend 验证一批请求的
 逐项成功/失败结果、提交完成与对端可消费边界；实机可用后再做 W/线程/payload 扫描。
+
+## 2026-10-05：首个 KV batch put/offload API
+
+基线：`bc10e2d5fd94b0cf332fb432d29a8c2b2e419168`，`codex/urmacpu`。
+
+**场景假设**：KV offload/prefetch 的最小有用接口不是固定大小循环，而是一批离散
+block；业务需要逐块知道源何时可复用、传输是否成功，且不能把 transport completion
+虚推为 NPU kernel 已可消费。选择 CPU→NPU batch put 作为首个应用切口，暂不扩展
+get、key index、SSD 或推理引擎集成。
+
+候选比较：activation/中间结果通常先表现为少量连续大 tensor，现有 benchmark 已能
+覆盖其基础 WRITE 路径；CPU index/offload 还依赖算子运行时与任务队列。KV batch 的
+离散块、部分失败和预取窗口与当前 scheduler 能力直接相交，也能在无 NPU 时验证业务
+契约，因此优先级最高。这个判断只说明工程切入点，不声称 KV 已有实机收益。
+
+**架构决定与实现**：
+
+- `TransferWork/TransferRequest` 新增 application tag、源/目标 region 相对 offset 和
+  operation index；`CompletionTracker` 保存调用者 context，使乱序 CR 能回到原项。
+- 新增 `kv_put_batch.h`：输入多个 `{block_id, source_offset, destination_offset,
+  bytes}`，输出逐项生命周期与错误证据；全 batch 验证通过后才允许第一个 post。
+- 拒绝零长度、地址溢出、注册区越界、重复 block ID 和重叠目标；允许共享只读源。
+- 明确五个 item 状态及 `source_reusable/transfer_complete`；
+  `peer_consumable_proven` 始终 false，等待独立可见性/通知协议。
+- 保留非幂等失败语义：不自动重试；post 失败后的项保持 `not_submitted`，poll 失败
+  的已提交项保持 backend ownership。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+for test in completion_tracker transfer_layout window_scheduler kv_put_batch; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+# completion_tracker: 36134 checks passed
+# transfer_layout: 19565 checks passed
+# window_scheduler: 86 checks passed
+# kv_put_batch: 51 checks passed
+
+# 四套测试同样以 ASan/UBSan 运行；LeakSanitizer 关闭
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -isystem /tmp/umdk-day5/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+# passed against openEuler UMDK mirror e720dbead0b6 fetched 2026-10-05
+```
+
+四套测试合计 55,836 次显式断言。KV reference backend 复制并逐字节核对 4 个离散
+block，另覆盖 7 类输入拒绝、共享源、部分提交及 completion/poll 故障。这不是实机
+测试；目标 CANN 9.1 链接、URMA 对离散块的实际提交方式、HBM 可见性和性能未验证。
+
+**下一步**：当前 KV adapter 已形成业务语义，但尚无生产 `UrmaKvPutBackend` 的注册
+region/session 生命周期。下一轮优先抽出可复用 registered-region/session 对象，把
+adapter 接到 URMA 地址与 segment，同时仍以 W=1 保留基线；对端消费通知只有在核实
+目标 SDK 支持后才实现。

@@ -25,7 +25,7 @@ int main() {
     require(tracker.reset(2) && tracker.capacity() == 2, "configure two slots");
     require(tracker.reserve(0, 512).error == CompletionError::invalid_request, "zero id");
     require(tracker.reserve(1, 0).error == CompletionError::invalid_request, "zero bytes");
-    const auto first = tracker.reserve(1, 512);
+    const auto first = tracker.reserve(1, 512, 42);
     require(first.error == CompletionError::none && first.slot == 0, "reserve first slot");
     require(tracker.reserve(1, 512).error == CompletionError::duplicate_request, "duplicate id");
     require(tracker.in_flight() == 1, "duplicate does not change ownership");
@@ -36,7 +36,8 @@ int main() {
     require(tracker.in_flight() == 1, "unknown completion preserves pending request");
     check = tracker.complete(1, true, 256);
     require(check.error == CompletionError::length_mismatch && check.request_retired &&
-            check.expected_bytes == 512, "length mismatch retires named request as failed");
+            check.expected_bytes == 512 && check.user_context == 42,
+            "length mismatch retires request and preserves caller context");
     require(tracker.empty(), "length failure leaves no phantom in-flight request");
 
     require(tracker.reserve(2, 1024).error == CompletionError::none, "submit transport error case");
