@@ -32,6 +32,19 @@ if(BUILD_TESTING)
     target_include_directories(kv_put_batch_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_options(kv_put_batch_test PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv_put_batch COMMAND kv_put_batch_test)
+
+    add_executable(registered_region_test tests/registered_region_test.cpp)
+    target_include_directories(registered_region_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_options(registered_region_test PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME registered_region COMMAND registered_region_test)
+
+    if(BUILD_URMA_BENCH)
+        # Uses official URMA types but stubs post/poll, so no device is needed.
+        add_executable(urma_kv_backend_test tests/urma_kv_backend_test.cpp)
+        target_include_directories(urma_kv_backend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_options(urma_kv_backend_test PRIVATE -Wall -Wextra -Wpedantic)
+        add_test(NAME urma_kv_backend COMMAND urma_kv_backend_test)
+    endif()
 endif()
 
 # Example when the CANN/URMA headers and libraries are not in system paths:

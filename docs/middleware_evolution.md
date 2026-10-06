@@ -289,3 +289,51 @@ block，另覆盖 7 类输入拒绝、共享源、部分提交及 completion/pol
 region/session 生命周期。下一轮优先抽出可复用 registered-region/session 对象，把
 adapter 接到 URMA 地址与 segment，同时仍以 W=1 保留基线；对端消费通知只有在核实
 目标 SDK 支持后才实现。
+
+## 2026-10-06：把 KV offset 绑定到真实 URMA WR
+
+基线：`e541eaddf7c89db71d1981561a489b0e40dc26be`，`codex/urmacpu`。
+
+**场景假设**：KV adapter 如果只在 reference memory backend 上运行，仍无法证明离散
+offset 会正确进入 CPU 本地 segment 与 NPU 导入 segment。最高优先级是建立窄且可复用
+的 registered-region binding，把 batch 请求映射到真实 `urma_sge_t/urma_jfs_wr_t`；
+session ownership 与设备可见性继续保持独立，不借地址映射假装已经解决。
+
+**架构决定与实现**：
+
+- 新增 transport-independent `RegisteredRegionView` 与 range resolver；使用相对 offset，
+  检查零长度、注册容量、起始地址及最后一字节溢出，源/目标错误分别保留。
+- 新增非 owning `UrmaRegionBinding` 和 `UrmaKvPutBackend`；按请求离散 offset 构造本地/
+  远端 SGE、signaled WRITE，并标准化 completion。backend 不拥有或隐式释放任何资源。
+- 上层 KV batch 和 transport post 边界执行两层验证；非法 binding/range 在 provider
+  调用前失败。provider post 状态原样交给 scheduler，不增加无依据重试。
+- benchmark 包含新 backend 并通过官方头文件编译；原固定槽 benchmark 路径和输出不变。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+for test in completion_tracker transfer_layout window_scheduler kv_put_batch registered_region; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+
+g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+  -isystem /tmp/umdk-day6/src/urma/lib/urma/core/include -Iexamples \
+  examples/tests/urma_kv_backend_test.cpp -o /tmp/urma_kv_backend_test
+/tmp/urma_kv_backend_test
+# urma_kv_backend: 15 checks passed
+
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -isystem /tmp/umdk-day6/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+```
+
+五套无 SDK 测试与一套官方类型 stub-provider 测试合计 80,665 次显式断言；其中
+registered-region 小域穷举 24,814 次，WR 测试直接捕获并核对两端 SGE、segment、
+Jetty、`user_ctx` 和成功/失败 CR。全部测试同时以 ASan/UBSan 运行通过；当前环境没有
+CMake，使用等价直接编译。头文件版本为 openEuler UMDK `e720dbead0b6`。
+
+**未验证与下一步**：没有目标 CANN 9.1、NPU/UB，未验证链接、权限、HBM 可见性、
+吞吐或 CPU 开销。当前 binding 刻意不拥有资源，最大瓶颈转为可复用 session 生命周期：
+下一轮抽出 context/JFC/JFR/Jetty/segment 的有序创建与销毁，只有已知 drain 才释放，
+未知在途继续 quarantine；随后再让实际 KV entry point 使用该 session。

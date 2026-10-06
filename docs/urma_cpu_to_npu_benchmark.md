@@ -313,3 +313,26 @@ load/store 内存语义、NPU kernel 可消费事件严格分离；后续必须�
 reference-memory backend 验证离散 offset 实际复制、W=2 背压、乱序完成、共享只读
 源、逐项状态、部分 post 失败、poll 失败、错误/短 completion 和全部输入边界。
 这些结果验证 API 契约，不代表 URMA SGL、设备数据可见性或实机性能已经验证。
+
+## 12. Registered region 与 URMA KV backend
+
+`registered_region.h` 把“已注册区域中的 offset”解析为 transport address。它同时检查
+请求长度、region 容量、`base + offset` 和最后一个字节的 `uint64_t` 溢出，并分别保留
+源、目标侧的错误。该结构只是数值 view，不注册内存、不拥有 provider handle，也不
+把 NPU UBVA 当作 CPU 可解引用指针。
+
+`urma_kv_backend.h` 提供非 owning 的 `UrmaRegionBinding` 和 `UrmaKvPutBackend`：调用者
+分别绑定 CPU 本地注册 segment、NPU 导入 segment、Jetty/JFC 与远端 Jetty；backend
+按每个 `TransferRequest` 的 source/destination offset 构造两个 SGE 和 signaled
+`URMA_OPC_WRITE`，并把 CR 标准化为公共 completion。上层 batch 已验证输入，但
+backend 在 post 边界再次执行 region/地址检查，防止绕过 adapter 的调用把越界 WR
+交给 provider。热路径没有堆分配或虚函数。
+
+该 binding 不拥有 context、segment、Jetty 或 buffer。session 必须保证：请求全部
+命名退休之前资源持续有效；未知 CR、poll 错误或超时后不得据此普通释放资源。
+当前 benchmark 的 `ThreadContext` 仍承担这个生命周期，尚未抽成可复用 RAII session。
+
+`urma_kv_backend_test` 使用 openEuler UMDK 官方结构体并 stub 仅有的 post/poll 调用，
+直接核对 WR opcode、completion flag、两端 SGE address/length/segment、target Jetty、
+`user_ctx`、provider 错误透传和 CR 标准化。它没有访问设备，不能证明目标 CANN ABI、
+segment 权限、数据可见性或性能。

@@ -27,6 +27,7 @@
 #include "urma_api.h"
 #include "completion_tracker.h"
 #include "transfer_layout.h"
+#include "urma_kv_backend.h"
 #include "window_scheduler.h"
 
 namespace {
