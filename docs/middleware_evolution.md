@@ -337,3 +337,58 @@ CMake，使用等价直接编译。头文件版本为 openEuler UMDK `e720dbead0
 吞吐或 CPU 开销。当前 binding 刻意不拥有资源，最大瓶颈转为可复用 session 生命周期：
 下一轮抽出 context/JFC/JFR/Jetty/segment 的有序创建与销毁，只有已知 drain 才释放，
 未知在途继续 quarantine；随后再让实际 KV entry point 使用该 session。
+
+## 2026-10-07：可复用、失败封闭的 URMA session
+
+基线：`5b5794ba6e1f704cdba37c008bf446500ce90dab`，`codex/urmacpu`。
+
+**场景假设**：KV offload/prefetch 是常驻数据面，若每批重新创建 context、队列、Jetty
+和注册内存，建链与注册开销会进入业务路径；但把资源做成长生命周期后，只有证明全部
+WR 已退休才能释放。最高优先级是把实际 benchmark 的 provider 资源抽成可复用 session，
+并让所有部分建立、drain 和 teardown 失败都 fail-closed，而不是先做未经实机证明的
+批量 post 优化。
+
+**架构决定与实现**：
+
+- 新增不可复制/移动的 `UrmaSession`，拥有一 worker 的 context、JFC/JFR/Jetty、本地
+  buffer/segment、远端导入 segment/Jetty、completion tracker 和 request ID；同时导出
+  KV backend 可直接使用的 registered-region bindings。
+- open 查询并保留设备队列能力，逐层建立依赖；任一点失败逆序 rollback，同时保留
+  primary error 与 rollback error。窗口溢出及 `JFC=window+1`、`JFS=window`、`JFR>=1`
+  能力不足在创建数据面对象前拒绝。
+- close 区分 `closed/already_closed/in_flight/quarantined/provider_error`。已知在途可在
+  drain 后重试；未知在途永久 quarantine。任一 provider teardown 失败立即停止级联
+  销毁且不自动重试，因为没有幂等保证。
+- benchmark 删除手工 `ThreadContext` 创建/释放，改为按 worker 复用 session，并把
+  open 能力错误、rollback 失败和 close 失败输出为可定位证据。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+for test in completion_tracker transfer_layout window_scheduler kv_put_batch registered_region; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+
+for test in urma_kv_backend urma_session; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+    -isystem /tmp/umdk-day7/src/urma/lib/urma/core/include -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+
+g++ -std=c++17 -Wall -Wextra -Wpedantic -Werror -pthread \
+  -isystem /tmp/umdk-day7/src/urma/lib/urma/core/include -Iexamples \
+  -fsyntax-only examples/urma_cpu_to_npu_bench.cpp
+```
+
+七套测试合计 80,713 次显式断言；新增 session 测试 48 项，覆盖完整依赖顺序、八个
+open 失败点、能力拒绝、已知 drain 后重试、未知在途隔离、teardown 失败停止级联，
+以及 open 主失败和 rollback 失败并存。全部测试另以 ASan/UBSan 运行。官方类型来自
+openEuler UMDK `e720dbead0b6dba8742028e162afed5dfd58df95`。当前环境没有 CMake，
+因此使用等价的直接编译和运行。
+
+**未验证与下一步**：没有目标 CANN 9.1、NPU/UB，未验证真实链接、设备权限、provider
+quiescence/flush、HBM 可见性、资源回收或性能；上述断言数不是设备实验数。当前最大
+瓶颈是 KV API 尚未拥有明确的 session-facing entry point。下一轮优先把 `put_batch`
+绑定到 session 并定义显式 drain/close 调用路径；同时核实目标 SDK 是否提供 suspend/
+flush，只有获得语义证据后才实现在线故障恢复或对端可消费通知。

@@ -328,11 +328,35 @@ reference-memory backend 验证离散 offset 实际复制、W=2 背压、乱序�
 backend 在 post 边界再次执行 region/地址检查，防止绕过 adapter 的调用把越界 WR
 交给 provider。热路径没有堆分配或虚函数。
 
-该 binding 不拥有 context、segment、Jetty 或 buffer。session 必须保证：请求全部
+该 binding 不拥有 context、segment、Jetty 或 buffer。`UrmaSession` 保证：请求全部
 命名退休之前资源持续有效；未知 CR、poll 错误或超时后不得据此普通释放资源。
-当前 benchmark 的 `ThreadContext` 仍承担这个生命周期，尚未抽成可复用 RAII session。
 
 `urma_kv_backend_test` 使用 openEuler UMDK 官方结构体并 stub 仅有的 post/poll 调用，
 直接核对 WR opcode、completion flag、两端 SGE address/length/segment、target Jetty、
 `user_ctx`、provider 错误透传和 CR 标准化。它没有访问设备，不能证明目标 CANN ABI、
 segment 权限、数据可见性或性能。
+
+## 13. 可复用 URMA session 与 fail-closed teardown
+
+`urma_session.h` 把每个 worker 的 context、JFC、JFR、Jetty、本地注册 segment、远端
+导入 segment/Jetty、源 buffer 和 completion tracker 收拢为一个不可复制、不可移动的
+session。benchmark 现在通过该对象建立和复用资源，数据面仍保持一 worker 一 session，
+不假设 provider 对跨线程共享对象是安全的。`source_binding()` 与
+`destination_binding()` 可直接供 KV batch backend 使用，避免重新注册或复制数据。
+
+open 过程先查询能力，再按 `JFC -> JFR -> Jetty -> buffer -> local segment -> remote
+segment -> remote Jetty` 建立依赖。任一步失败都按逆序 rollback，并同时返回主要失败
+和 rollback 失败；不让清理错误掩盖原始错误。设备能力小于 `JFC=window+1`、
+`JFS=window`、`JFR>=1` 时显式拒绝，不把设备上限当作可用能力。
+
+close 只有 completion tracker 证明零在途时才执行逆序 teardown。已知在途请求返回
+`in_flight`，调用者 drain 后可以重试；未知 completion/poll/timeout 会先 quarantine，
+之后不再调用 provider 销毁函数。任一 unimport/delete/unregister 返回失败时也立即停止
+后续 teardown 并 quarantine，避免在依赖项可能仍存活时级联释放 owner。这里刻意不重试
+销毁操作，因为公开契约没有证明失败调用是幂等的。析构函数只尝试同一套 close；常驻
+服务必须显式检查 close 结果，不能把进程退出回收当作在线恢复。
+
+stub-provider 测试覆盖完整建立/销毁顺序、八个 open 失败点、队列能力不足、drain 后
+重试、显式 quarantine、teardown 失败停止级联，以及“主要 open 失败 + rollback 失败”
+的双重证据。它验证所有权状态机和官方类型兼容性，不证明目标 provider 的 flush、
+quiescence、HBM 可见性或真实资源回收行为。

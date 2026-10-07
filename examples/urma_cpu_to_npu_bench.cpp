@@ -14,7 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <malloc.h>
+#include <memory>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -28,13 +28,13 @@
 #include "completion_tracker.h"
 #include "transfer_layout.h"
 #include "urma_kv_backend.h"
+#include "urma_session.h"
 #include "window_scheduler.h"
 
 namespace {
 using Clock = std::chrono::steady_clock;
 constexpr uint32_t kMagic = 0x48424D55;
 constexpr uint32_t kVersion = 1;
-constexpr uint64_t kPageSize = 4096;
 constexpr uint32_t kMaxWindow = 64;
 
 enum class ControlCommand : uint32_t { kHostWriteDone = 1, kFillHbm = 2, kDone = 3 };
@@ -80,20 +80,6 @@ struct StartGate {
     std::condition_variable cv;
     uint32_t remaining;
     bool open = false;
-};
-
-struct ThreadContext {
-    urma_context_t *context = nullptr;
-    urma_jfc_t *jfc = nullptr;
-    urma_jfr_t *jfr = nullptr;
-    urma_jetty_t *jetty = nullptr;
-    urma_target_seg_t *local_seg = nullptr;
-    urma_target_seg_t *remote_seg = nullptr;
-    urma_target_jetty_t *remote_jetty = nullptr;
-    void *buffer = nullptr;
-    uint64_t request_id = 0;
-    gamaq::CompletionTracker completions;
-    bool safe_to_destroy = true;
 };
 
 bool parse_u64(const char *s, uint64_t *out) {
@@ -201,121 +187,22 @@ int find_eid_index(urma_device_t *device) {
     return index;
 }
 
-void destroy_context(ThreadContext *c) {
-    if (!c->safe_to_destroy || !c->completions.empty()) {
-        std::fprintf(stderr, "quarantining URMA context with %zu possibly in-flight WR(s); "
-                             "process exit owns final provider cleanup\n",
-                     c->completions.in_flight());
-        return;
-    }
-    // Dependents are destroyed before their owners.  Do not share these
-    // objects between worker threads: vendor thread-safety is not assumed.
-    if (c->remote_jetty) urma_unimport_jetty(c->remote_jetty);
-    if (c->remote_seg) urma_unimport_seg(c->remote_seg);
-    if (c->jetty) urma_delete_jetty(c->jetty);
-    if (c->local_seg) urma_unregister_seg(c->local_seg);
-    if (c->jfr) urma_delete_jfr(c->jfr);
-    if (c->jfc) urma_delete_jfc(c->jfc);
-    if (c->context) urma_delete_context(c->context);
-    std::free(c->buffer);
-    *c = {};
-}
-
-int create_context(urma_device_t *device, uint32_t eid_index, uint32_t size,
-                   uint32_t window, const NpuHbmExport &remote, ThreadContext *c) {
-    if (!c->completions.reset(window)) return -1;
-    c->context = urma_create_context(device, eid_index);
-    if (!c->context) return -1;
-    urma_device_attr_t attr {};
-    if (urma_query_device(device, &attr)) return -1;
-    urma_jfc_cfg_t jfc_cfg {};
-    // One extra JFC entry is reserved for an asynchronous Jetty error CR, as
-    // recommended by the public API guide for one associated Jetty.
-    if (attr.dev_cap.max_jfc_depth < window + 1 ||
-        attr.dev_cap.max_jfs_depth < window || !attr.dev_cap.max_jfr_depth) {
-        std::fprintf(stderr, "device queue depth is smaller than window %u "
-            "(max_jfc=%u, max_jfs=%u, max_jfr=%u)\n", window,
-            attr.dev_cap.max_jfc_depth, attr.dev_cap.max_jfs_depth,
-            attr.dev_cap.max_jfr_depth);
-        return -1;
-    }
-    jfc_cfg.depth = window + 1;
-    c->jfc = urma_create_jfc(c->context, &jfc_cfg);
-    if (!c->jfc) return -1;
-    urma_token_t token {};
-    token.token = 0xEFCD;
-    urma_jfr_cfg_t jfr_cfg {};
-    jfr_cfg.depth = 1;
-    jfr_cfg.flag.bs.tag_matching = URMA_NO_TAG_MATCHING;
-    jfr_cfg.trans_mode = URMA_TM_RM;
-    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
-    jfr_cfg.jfc = c->jfc;
-    jfr_cfg.token_value = token;
-    jfr_cfg.max_sge = 1;
-    c->jfr = urma_create_jfr(c->context, &jfr_cfg);
-    if (!c->jfr) return -1;
-    urma_jfs_cfg_t jfs {};
-    jfs.depth = window;
-    jfs.trans_mode = URMA_TM_RM;
-    jfs.priority = URMA_MAX_PRIORITY;
-    jfs.max_sge = 1;
-    jfs.rnr_retry = URMA_TYPICAL_RNR_RETRY;
-    jfs.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
-    jfs.jfc = c->jfc;
-    urma_jetty_cfg_t jetty_cfg {};
-    jetty_cfg.flag.bs.share_jfr = 1;
-    jetty_cfg.jfs_cfg = jfs;
-    jetty_cfg.shared.jfr = c->jfr;
-    c->jetty = urma_create_jetty(c->context, &jetty_cfg);
-    if (!c->jetty) return -1;
-    const size_t buffer_bytes = static_cast<size_t>(size) * window;
-    c->buffer = memalign(kPageSize, buffer_bytes);
-    if (!c->buffer) return -1;
-    std::memset(c->buffer, 0xA5, buffer_bytes);
-    urma_reg_seg_flag_t reg_flag {};
-    reg_flag.bs.token_policy = URMA_TOKEN_NONE;
-    reg_flag.bs.cacheable = URMA_NON_CACHEABLE;
-    reg_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
-    urma_seg_cfg_t seg_cfg {};
-    seg_cfg.va = reinterpret_cast<uint64_t>(c->buffer);
-    seg_cfg.len = buffer_bytes;
-    seg_cfg.token_value = token;
-    seg_cfg.flag = reg_flag;
-    c->local_seg = urma_register_seg(c->context, &seg_cfg);
-    if (!c->local_seg) return -1;
-    urma_import_seg_flag_t import_flag {};
-    import_flag.bs.cacheable = URMA_NON_CACHEABLE;
-    import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
-    import_flag.bs.mapping = URMA_SEG_NOMAP;
-    // The public API accepts a mutable segment descriptor. Import a copy so
-    // the provider cannot mutate the control-plane export retained by callers.
-    urma_seg_t remote_seg = remote.remote_seg;
-    c->remote_seg = urma_import_seg(c->context, &remote_seg, &token, 0, import_flag);
-    if (!c->remote_seg) return -1;
-    urma_rjetty_t rjetty {};
-    rjetty.jetty_id = remote.remote_jetty_id;
-    rjetty.trans_mode = URMA_TM_RM;
-    rjetty.type = URMA_JETTY;
-    rjetty.tp_type = URMA_CTP;
-    c->remote_jetty = urma_import_jetty(c->context, &rjetty, &token);
-    return c->remote_jetty ? 0 : -1;
-}
-
 class UrmaWriteBackend {
 public:
-    UrmaWriteBackend(ThreadContext *context, uint64_t remote_base, uint32_t payload)
+    UrmaWriteBackend(gamaq::UrmaSession *context, uint64_t remote_base,
+                     uint32_t payload)
         : c_(context), remote_base_(remote_base), payload_(payload) {}
 
     int post(gamaq::TransferRequest request) {
         const uint64_t slot_offset = uint64_t{request.slot} * payload_;
         urma_sge_t local {};
-        local.addr = reinterpret_cast<uint64_t>(c_->buffer) + slot_offset;
+        local.addr = reinterpret_cast<uint64_t>(c_->buffer()) + slot_offset;
         local.len = request.bytes;
-        local.tseg = c_->local_seg;
+        local.tseg = c_->local_segment();
         urma_sge_t target {};
         target.addr = remote_base_ + slot_offset;
         target.len = request.bytes;
-        target.tseg = c_->remote_seg;
+        target.tseg = c_->remote_segment();
         urma_sg_t src {&local, 1};
         urma_sg_t dst {&target, 1};
         urma_rw_wr_t rw {};
@@ -324,16 +211,16 @@ public:
         urma_jfs_wr_t wr {};
         wr.opcode = URMA_OPC_WRITE;
         wr.flag.bs.complete_enable = 1;
-        wr.tjetty = c_->remote_jetty;
+        wr.tjetty = c_->remote_jetty();
         wr.user_ctx = request.request_id;
         wr.rw = rw;
         urma_jfs_wr_t *bad = nullptr;
-        return urma_post_jetty_send_wr(c_->jetty, &wr, &bad);
+        return urma_post_jetty_send_wr(c_->jetty(), &wr, &bad);
     }
 
     int poll(gamaq::TransferCompletion *out, int max_count) {
         std::array<urma_cr_t, gamaq::kMaxCompletionBatch> completions {};
-        const int count = urma_poll_jfc(c_->jfc, max_count, completions.data());
+        const int count = urma_poll_jfc(c_->jfc(), max_count, completions.data());
         if (count <= 0) return count;
         if (count > max_count) return count;
         for (int i = 0; i < count; ++i) {
@@ -346,7 +233,7 @@ public:
     }
 
 private:
-    ThreadContext *c_;
+    gamaq::UrmaSession *c_;
     uint64_t remote_base_;
     uint32_t payload_;
 };
@@ -364,15 +251,15 @@ int window_result_status(const gamaq::WindowRunResult &result) {
     }
 }
 
-int run_write_window(ThreadContext *c, uint64_t remote_worker_base, uint32_t size,
+int run_write_window(gamaq::UrmaSession *c, uint64_t remote_worker_base, uint32_t size,
                      uint64_t operations, uint64_t timeout_ms,
                      std::atomic<bool> *stop, uint64_t *completed_operations) {
     UrmaWriteBackend backend(c, remote_worker_base, size);
-    const auto result = gamaq::run_bounded_window(c->completions, c->request_id, size,
-        operations, std::chrono::milliseconds(timeout_ms), *stop, backend);
+    const auto result = gamaq::run_bounded_window(c->completions(), c->request_id(),
+        size, operations, std::chrono::milliseconds(timeout_ms), *stop, backend);
     *completed_operations = result.completed;
     if (result.error == gamaq::WindowError::none) return 0;
-    if (!result.safe_to_destroy()) c->safe_to_destroy = false;
+    if (!result.safe_to_destroy()) c->quarantine();
 
     std::fprintf(stderr, "WRITE window failed: %s (submitted=%llu, completed=%llu, "
         "in_flight=%zu, drained=%d)", gamaq::window_error_message(result.error),
@@ -399,6 +286,22 @@ int run_write_window(ThreadContext *c, uint64_t remote_worker_base, uint32_t siz
 
 struct Result { uint64_t operations = 0, nanoseconds = 0; int status = 0; };
 
+int close_session(gamaq::UrmaSession *session) {
+    const auto result = session->close();
+    if (result.closed()) return 0;
+    if (result.state == gamaq::UrmaSessionCloseState::provider_error) {
+        std::fprintf(stderr, "URMA session teardown failed at %s: status=%d; "
+            "remaining resources quarantined until process exit\n",
+            gamaq::urma_session_resource_message(result.resource),
+            result.provider_status);
+    } else {
+        std::fprintf(stderr, "quarantining URMA session with %zu possibly "
+            "in-flight WR(s); process exit owns final provider cleanup\n",
+            result.in_flight);
+    }
+    return -1;
+}
+
 bool check_layout(const NpuHbmExport &remote, uint32_t threads, uint32_t window,
                   uint32_t size) {
     const auto error = gamaq::validate_window_layout(remote.remote_seg.ubva.va,
@@ -417,12 +320,36 @@ int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remo
              uint32_t thread_count, uint32_t size, uint32_t window, uint64_t warmup,
              uint64_t iterations, uint64_t completion_timeout_ms) {
     if (!check_layout(remote, thread_count, window, size)) return -1;
-    std::vector<ThreadContext> contexts(thread_count);
-    for (auto &context : contexts) {
-        if (create_context(device, eid_index, size, window, remote, &context)) {
-            for (auto &item : contexts) destroy_context(&item);
+    std::vector<std::unique_ptr<gamaq::UrmaSession>> contexts;
+    contexts.reserve(thread_count);
+    for (uint32_t id = 0; id < thread_count; ++id) {
+        auto context = std::make_unique<gamaq::UrmaSession>();
+        gamaq::UrmaSessionConfig config;
+        config.device = device;
+        config.eid_index = eid_index;
+        config.payload_bytes = size;
+        config.window = window;
+        config.remote_segment = remote.remote_seg;
+        config.remote_jetty_id = remote.remote_jetty_id;
+        const auto opened = context->open(config);
+        if (!opened.ok()) {
+            std::fprintf(stderr, "URMA session open failed: %s",
+                gamaq::urma_session_open_error_message(opened.error));
+            if (opened.provider_status)
+                std::fprintf(stderr, ", provider_status=%d", opened.provider_status);
+            if (opened.error == gamaq::UrmaSessionOpenError::insufficient_queue_depth)
+                std::fprintf(stderr, " (window=%u, max_jfc=%u, max_jfs=%u, max_jfr=%u)",
+                    window, opened.max_jfc_depth, opened.max_jfs_depth,
+                    opened.max_jfr_depth);
+            if (!opened.rollback.closed())
+                std::fprintf(stderr, ", rollback_failed_at=%s, rollback_status=%d",
+                    gamaq::urma_session_resource_message(opened.rollback.resource),
+                    opened.rollback.provider_status);
+            std::fputc('\n', stderr);
+            for (auto &item : contexts) (void)close_session(item.get());
             return -1;
         }
+        contexts.push_back(std::move(context));
     }
     StartGate gate(thread_count);
     std::atomic<bool> stop {false};
@@ -441,12 +368,12 @@ int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remo
                 return;
             }
             uint64_t warmed = 0;
-            results[id].status = run_write_window(&contexts[id], region->address, size,
+            results[id].status = run_write_window(contexts[id].get(), region->address, size,
                 warmup, completion_timeout_ms, &stop, &warmed);
             gate.arrive_and_wait();
             if (results[id].status) return;
             auto begin = Clock::now();
-            results[id].status = run_write_window(&contexts[id], region->address, size,
+            results[id].status = run_write_window(contexts[id].get(), region->address, size,
                 iterations, completion_timeout_ms, &stop, &results[id].operations);
             results[id].nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - begin).count();
         });
@@ -464,9 +391,12 @@ int run_case(urma_device_t *device, uint32_t eid_index, const NpuHbmExport &remo
     double gbps = seconds ? (operations * double(size) * 8.0 / seconds / 1e9) : 0;
     double mops = seconds ? operations / seconds / 1e6 : 0;
     double avg_us = operations ? (sum_ns / 1000.0 / operations) : 0;
+    for (auto &context : contexts) {
+        const int close_status = close_session(context.get());
+        status = status ? status : close_status;
+    }
     std::printf("%u,%u,%u,%llu,%.3f,%.3f,%.3f,%d\n", thread_count, size, window,
                 static_cast<unsigned long long>(operations), gbps, mops, avg_us, status);
-    for (auto &context : contexts) destroy_context(&context);
     return status;
 }
 
