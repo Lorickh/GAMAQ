@@ -360,3 +360,28 @@ stub-provider 测试覆盖完整建立/销毁顺序、八个 open 失败点、�
 重试、显式 quarantine、teardown 失败停止级联，以及“主要 open 失败 + rollback 失败”
 的双重证据。它验证所有权状态机和官方类型兼容性，不证明目标 provider 的 flush、
 quiescence、HBM 可见性或真实资源回收行为。
+
+## 14. Session-facing KV put 与运行后健康状态
+
+`urma_kv_session.h` 提供首个实际应用入口 `run_urma_kv_put_batch()`。调用者先把 KV
+数据写入 `UrmaSession::buffer()` 的预注册区域，再提交相对源/目标 offset；入口自动把
+session 拥有的 Jetty、JFC、本地 segment、远端导入 segment/Jetty、completion tracker
+和单调 request ID 绑定到 `UrmaKvPutBackend`。连续 batch 复用同一组 provider 资源，
+但同一 session 不允许混入已有在途请求。多 worker 仍应使用各自 session。
+
+运行结束后不能把“资源可销毁”与“连接可继续使用”混为一谈：
+
+- 全部成功，或 batch 在 provider 调用前验证失败：session 保持 ready，可提交下一批；
+- post 失败或已命名的错误 completion 已完整 drain：session 标记 retired，禁止隐式重试
+  或继续提交，但允许按正常依赖顺序 close；
+- poll 失败、未知 completion 或 timeout 导致所有权不明：session 标记 quarantined，
+  禁止提交和 provider teardown，等待进程退出或未来经目标 SDK 核实的恢复流程。
+
+外部 stop 导致的已 drain cancellation 不自动判定 provider 故障，调用者清除 stop 后
+可以复用；这与 transport 错误的退役路径分离。所有 item 仍只把命名传输 completion
+解释为源可复用/传输完成，不把它提升为 NPU kernel 可消费。
+
+stub-provider 测试已经直接执行两批离散 KV put，核对两端地址、segment 和 request ID
+跨批递增；同时覆盖输入预检、非法 timeout、已有在途拒绝、post/命名 completion 失败
+后的退役，以及 poll 失败后的隔离。该入口没有加入数据复制或内存分配策略，业务数据
+如何进入预注册 buffer、以及对端消费通知仍属于更上层协议。

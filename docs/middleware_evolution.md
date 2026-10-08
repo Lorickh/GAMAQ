@@ -392,3 +392,50 @@ quiescence/flush、HBM 可见性、资源回收或性能；上述断言数不是
 瓶颈是 KV API 尚未拥有明确的 session-facing entry point。下一轮优先把 `put_batch`
 绑定到 session 并定义显式 drain/close 调用路径；同时核实目标 SDK 是否提供 suspend/
 flush，只有获得语义证据后才实现在线故障恢复或对端可消费通知。
+
+## 2026-10-08：把 KV put 接入长生命周期 session
+
+基线：`381ae46c76fae3b4d6083f5200feea0c7e35cc84`，`codex/urmacpu`。
+
+**场景假设**：仅有 session 和非 owning KV backend 仍要求业务手工拼接 handle、tracker
+和错误状态，容易把“全部 WR 已 drain、资源可销毁”误当成“Jetty 可继续使用”。常驻
+KV offload 数据面需要一个实际 session-facing 入口，并在每批结束后区分可复用、可关闭
+但必须退役、所有权未知必须隔离三种状态。
+
+**架构决定与实现**：
+
+- 新增 `urma_kv_session.h`，以预注册 `UrmaSession::buffer()` 为源区域，直接组合离散
+  KV batch adapter、URMA WR backend、session handles、completion tracker 和单调 ID。
+- 连续成功 batch 复用同一 context/队列/Jetty/segment；发现已有在途请求、未打开/
+  已退役/已隔离 session 或非正 timeout 时，在 provider 调用前明确拒绝。
+- post 或命名错误 completion 已 drain 时标记 retired：禁止无依据恢复，但仍允许正常
+  close。poll/未知 completion/timeout 导致所有权不明时 quarantine：既不继续提交，
+  也不执行 provider teardown。仅输入预检失败不污染健康 session。
+- benchmark 的固定 WRITE 路径同步采用相同退役判断，避免已知 transport 错误后把
+  session 错误视为可复用。
+
+**验证证据**（Linux x86_64，GCC 13.3.0）：
+
+```bash
+for test in completion_tracker transfer_layout window_scheduler kv_put_batch registered_region; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+
+for test in urma_kv_backend urma_session; do
+  g++ -std=c++17 -O2 -Wall -Wextra -Wpedantic -Werror \
+    -isystem /tmp/umdk-day8/src/urma/lib/urma/core/include -Iexamples \
+    examples/tests/${test}_test.cpp -o /tmp/${test} && /tmp/${test}
+done
+```
+
+七套测试合计 80,741 次显式断言；session/provider 测试由 48 增至 76 项。新增覆盖两批
+离散 KV 的真实 WR 地址/segment 绑定、资源跨批复用、request ID 递增、输入和 timeout
+预检、已有在途拒绝、drained failure 退役以及 unknown ownership 隔离。全部测试另以
+ASan/UBSan 运行，benchmark 以 `-Werror` 通过同一头文件语法编译。2026-10-08 获取的
+openEuler UMDK 版本为 `4eab3e4ad170b06bfe5d5c1014341e81edb9bf58`。
+
+**未验证与下一步**：缺少目标 CANN 9.1、NPU/UB，未验证链接、真实 flush/quiescence、
+HBM 可见性、资源回收和性能。当前最大瓶颈转为调用者如何低开销填充预注册 buffer，
+以及传输完成后如何证明对端可消费。下一轮优先设计不复制的 staging/region 注册复用
+边界和最小可见性通知接口；只有目标 SDK 证据支持时才实现 flush/suspend 在线恢复。

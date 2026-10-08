@@ -45,7 +45,7 @@ if(BUILD_TESTING)
         target_compile_options(urma_kv_backend_test PRIVATE -Wall -Wextra -Wpedantic)
         add_test(NAME urma_kv_backend COMMAND urma_kv_backend_test)
 
-        # Exercises create/rollback/close with official types and stubbed provider calls.
+        # Exercises lifecycle and session-bound KV put with stubbed provider calls.
         add_executable(urma_session_test tests/urma_session_test.cpp)
         target_include_directories(urma_session_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_compile_options(urma_session_test PRIVATE -Wall -Wextra -Wpedantic)

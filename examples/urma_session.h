@@ -144,6 +144,7 @@ public:
 
         safe_to_destroy_ = true;
         teardown_failed_ = false;
+        retired_ = false;
         capabilities_ = {};
         request_id_ = 0;
         payload_bytes_ = config.payload_bytes;
@@ -249,9 +250,20 @@ public:
         return release_resources();
     }
 
-    void quarantine() { safe_to_destroy_ = false; }
+    // A retired session is drained and may be closed normally, but must not
+    // accept more WRs. A quarantined session has unknown provider ownership
+    // and must not destroy or reuse its resources in-process.
+    void retire() { retired_ = true; }
+    void quarantine() {
+        retired_ = true;
+        safe_to_destroy_ = false;
+    }
     bool is_open() const { return open_; }
+    bool is_retired() const { return retired_; }
     bool is_quarantined() const { return !safe_to_destroy_ || teardown_failed_; }
+    bool ready_for_submission() const {
+        return open_ && !retired_ && !is_quarantined() && completions_.empty();
+    }
     size_t in_flight() const { return completions_.in_flight(); }
     uint32_t payload_bytes() const { return payload_bytes_; }
     uint32_t window() const { return window_; }
@@ -359,6 +371,7 @@ private:
             context_ = nullptr;
         }
         open_ = false;
+        retired_ = false;
         payload_bytes_ = 0;
         window_ = 0;
         capabilities_ = {};
@@ -388,6 +401,7 @@ private:
     CompletionTracker completions_;
     urma_seg_t remote_descriptor_ {};
     bool open_ = false;
+    bool retired_ = false;
     bool safe_to_destroy_ = true;
     bool teardown_failed_ = false;
 };

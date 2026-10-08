@@ -1,6 +1,7 @@
-#include "urma_session.h"
+#include "urma_kv_session.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -38,6 +39,21 @@ uint32_t captured_jfc_depth = 0;
 uint32_t captured_jfs_depth = 0;
 uint64_t captured_buffer_address = 0;
 uint64_t captured_buffer_bytes = 0;
+struct CapturedWrite {
+    uint64_t request_id = 0;
+    uint64_t source_address = 0;
+    uint64_t destination_address = 0;
+    uint32_t bytes = 0;
+    urma_target_seg_t *source_segment = nullptr;
+    urma_target_seg_t *destination_segment = nullptr;
+};
+std::vector<CapturedWrite> pending_writes;
+std::vector<CapturedWrite> write_history;
+int post_calls = 0;
+int poll_calls = 0;
+int fail_post_at = 0;
+int poll_error = 0;
+bool fail_next_completion = false;
 urma_target_seg_t *const local_segment_handle =
     reinterpret_cast<urma_target_seg_t *>(uintptr_t{0x106});
 urma_target_seg_t *const remote_segment_handle =
@@ -60,6 +76,13 @@ void reset_provider() {
     captured_jfs_depth = 0;
     captured_buffer_address = 0;
     captured_buffer_bytes = 0;
+    pending_writes.clear();
+    write_history.clear();
+    post_calls = 0;
+    poll_calls = 0;
+    fail_post_at = 0;
+    poll_error = 0;
+    fail_next_completion = false;
 }
 
 urma_status_t close_status(gamaq::UrmaSessionResource resource) {
@@ -192,12 +215,51 @@ extern "C" urma_status_t urma_delete_context(urma_context_t *) {
     return status;
 }
 
+extern "C" urma_status_t urma_post_jetty_send_wr(
+        urma_jetty_t *, urma_jfs_wr_t *wr, urma_jfs_wr_t **bad_wr) {
+    ++post_calls;
+    *bad_wr = nullptr;
+    if (fail_post_at && post_calls == fail_post_at)
+        return static_cast<urma_status_t>(19);
+    const auto &source = wr->rw.src.sge[0];
+    const auto &destination = wr->rw.dst.sge[0];
+    const CapturedWrite captured {wr->user_ctx, source.addr, destination.addr,
+        source.len, source.tseg, destination.tseg};
+    pending_writes.push_back(captured);
+    write_history.push_back(captured);
+    return URMA_SUCCESS;
+}
+
+extern "C" int urma_poll_jfc(urma_jfc_t *, int max_count, urma_cr_t *out) {
+    ++poll_calls;
+    if (poll_error) return poll_error;
+    if (pending_writes.empty()) return 0;
+    const int count = std::min<int>(max_count,
+        static_cast<int>(pending_writes.size()));
+    for (int i = 0; i < count; ++i) {
+        const auto captured = pending_writes.back();
+        pending_writes.pop_back();
+        out[i].user_ctx = captured.request_id;
+        out[i].completion_len = captured.bytes;
+        if (fail_next_completion) {
+            out[i].status = URMA_CR_WR_FLUSH_ERR;
+            fail_next_completion = false;
+        } else {
+            out[i].status = URMA_CR_SUCCESS;
+        }
+    }
+    return count;
+}
+
 int main() {
     using gamaq::CompletionError;
+    using gamaq::KvBatchValidationError;
     using gamaq::UrmaSession;
     using gamaq::UrmaSessionCloseState;
     using gamaq::UrmaSessionOpenError;
     using gamaq::UrmaSessionResource;
+    using gamaq::UrmaKvSessionError;
+    using gamaq::WindowError;
 
     reset_provider();
     {
@@ -332,6 +394,133 @@ int main() {
                 "open result preserves primary and rollback failures");
         require(session.is_quarantined(),
                 "failed rollback leaves remaining resources fail-closed");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for KV put entry point");
+        const std::vector<gamaq::KvPutBlock> blocks {
+            {100, 16, 128, 64}, {101, 256, 2048, 128}, {102, 1024, 4096, 32}};
+        const auto first = gamaq::run_urma_kv_put_batch(
+            session, blocks, std::chrono::milliseconds(10));
+        require(first.started() && first.batch.valid() &&
+                first.batch.window.error == WindowError::none &&
+                first.batch.window.completed == blocks.size(),
+                "session-facing KV put completes a discrete batch");
+        require(session.ready_for_submission() && !session.is_retired(),
+                "clean batch leaves the persistent session reusable");
+        require(write_history.size() == blocks.size() &&
+                write_history[0].source_address == captured_buffer_address + 16 &&
+                write_history[0].destination_address == 0x800000 + 128 &&
+                write_history[0].source_segment == local_segment_handle &&
+                write_history[0].destination_segment == remote_segment_handle,
+                "session entry point binds KV offsets to owned URMA regions");
+        const uint64_t first_last_id = first.batch.items.back().request_id;
+        const auto second = gamaq::run_urma_kv_put_batch(session,
+            {{103, 64, 8192, 16}}, std::chrono::milliseconds(10));
+        require(second.batch.window.error == WindowError::none &&
+                second.batch.items[0].request_id > first_last_id,
+                "sequential batches reuse resources and preserve request identity");
+        require(session.close().state == UrmaSessionCloseState::closed &&
+                live_resources == 0, "reused KV session closes after a proven drain");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for preflight rejection");
+        const auto invalid = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 0}}, std::chrono::milliseconds(10));
+        require(invalid.started() && invalid.batch.validation_error ==
+                KvBatchValidationError::zero_length && post_calls == 0 &&
+                session.ready_for_submission(),
+                "invalid KV batch never reaches provider or retires session");
+        const auto timeout = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(0));
+        require(timeout.error == UrmaKvSessionError::invalid_timeout &&
+                post_calls == 0 && session.ready_for_submission(),
+                "invalid timeout is rejected before provider ownership");
+        std::atomic<bool> stop {true};
+        const auto canceled = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(10), stop);
+        require(canceled.batch.window.error == WindowError::canceled &&
+                canceled.batch.window.safe_to_destroy() && post_calls == 0 &&
+                session.ready_for_submission(),
+                "drained external cancellation does not poison healthy session");
+        require(session.close().closed(), "preflight-only session closes normally");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for busy rejection");
+        require(session.completions().reserve(55, 8).error == CompletionError::none,
+                "seed an existing provider-owned request");
+        const auto busy = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(10));
+        require(busy.error == UrmaKvSessionError::requests_in_flight &&
+                post_calls == 0,
+                "KV entry point refuses to mix batches in one tracker");
+        require(session.completions().complete(55, true, 8).request_retired,
+                "retire seeded request before close");
+        require(session.close().closed(), "drained busy session closes normally");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for post failure");
+        fail_post_at = 1;
+        const auto failed = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(10));
+        require(failed.batch.window.error == WindowError::post_error &&
+                failed.batch.window.safe_to_destroy() && session.is_retired() &&
+                !session.is_quarantined(),
+                "drained post failure retires but does not quarantine session");
+        const auto retry = gamaq::run_urma_kv_put_batch(session,
+            {{2, 8, 8, 8}}, std::chrono::milliseconds(10));
+        require(retry.error == UrmaKvSessionError::session_retired && post_calls == 1,
+                "retired session rejects unsupported implicit recovery");
+        require(session.close().closed() && live_resources == 0,
+                "retired and drained session remains safely closeable");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for completion failure");
+        fail_next_completion = true;
+        const auto failed = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(10));
+        require(failed.batch.window.error == WindowError::invalid_completion &&
+                failed.batch.window.safe_to_destroy() && session.is_retired(),
+                "named transport error drains ownership and retires session");
+        require(failed.batch.items[0].source_reusable &&
+                !failed.batch.items[0].transfer_complete,
+                "named failed completion releases source without claiming transfer");
+        require(session.close().closed(), "drained completion failure can close");
+    }
+
+    reset_provider();
+    {
+        UrmaSession session;
+        require(session.open(config()).ok(), "open session for unknown ownership");
+        poll_error = -29;
+        const auto failed = gamaq::run_urma_kv_put_batch(session,
+            {{1, 0, 0, 8}}, std::chrono::milliseconds(10));
+        require(failed.batch.window.error == WindowError::poll_error &&
+                !failed.batch.window.safe_to_destroy() &&
+                session.is_quarantined(),
+                "poll failure quarantines session with unknown provider ownership");
+        const auto retry = gamaq::run_urma_kv_put_batch(session,
+            {{2, 8, 8, 8}}, std::chrono::milliseconds(10));
+        require(retry.error == UrmaKvSessionError::session_quarantined &&
+                post_calls == 1,
+                "quarantined session rejects further KV submission");
+        require(session.close().state == UrmaSessionCloseState::quarantined &&
+                live_resources == 7,
+                "quarantined session skips provider teardown");
     }
 
     std::cout << "urma_session: " << checks << " checks passed\n";

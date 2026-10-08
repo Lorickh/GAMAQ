@@ -259,7 +259,11 @@ int run_write_window(gamaq::UrmaSession *c, uint64_t remote_worker_base, uint32_
         size, operations, std::chrono::milliseconds(timeout_ms), *stop, backend);
     *completed_operations = result.completed;
     if (result.error == gamaq::WindowError::none) return 0;
-    if (!result.safe_to_destroy()) c->quarantine();
+    if (!result.safe_to_destroy()) {
+        c->quarantine();
+    } else if (result.error != gamaq::WindowError::canceled) {
+        c->retire();
+    }
 
     std::fprintf(stderr, "WRITE window failed: %s (submitted=%llu, completed=%llu, "
         "in_flight=%zu, drained=%d)", gamaq::window_error_message(result.error),
